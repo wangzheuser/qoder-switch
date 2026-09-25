@@ -50,9 +50,16 @@ bash scripts/pack-npm.sh aarch64-apple-darwin x86_64-apple-darwin   # 在 mac �
 (cd npm && npm publish --access public)
 ```
 
+```powershell
+# Windows 上没有 Git-Bash 时走这条；平台表、产物位置与 npm/webui_dist 暂存和 .sh 一致
+powershell -ExecutionPolicy Bypass -File scripts/pack-npm.ps1
+powershell -ExecutionPolicy Bypass -File scripts/pack-npm.ps1 x86_64-pc-windows-msvc
+```
+
 主包的 `optionalDependencies` 里三个平台包版本必须与主版本一致，缺哪个包那个平台
 的 `npm install` 就会在 postinstall 阶段静默跳过（不报错，但装不出二进制）。
 
 版本号与仓库主版本保持一致（`package.json` × 2 + `npm/platform/*` × 3 +
-主版本三处 `Cargo.toml` + `tauri.conf.json`）；`pack-npm.sh` 会在打包前逐处核对，
-任一不符直接终止。
+主版本三处 `Cargo.toml` + `tauri.conf.json`）；核对逻辑在 `scripts/check-versions.cjs`
+里，`pack-npm.sh` 与 `pack-npm.ps1` 打包前都调它，任一不符直接终止 —— 两条入口各抄一份
+判断迟早只改一边，而漏掉的那边会发出错版本的包。

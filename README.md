@@ -64,6 +64,24 @@ bash scripts/build.sh release   # npx tauri build，bundle 目标按宿主自动
 bash scripts/build.sh all       # deps → icons → test → release
 ```
 
+同一套子命令另有 PowerShell 入口，**只走 Windows**，不需要 Git-Bash/MSYS（CI 的 windows
+runner 与只装了 PowerShell 的机器用这条）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/build.ps1 deps
+powershell -ExecutionPolicy Bypass -File scripts/build.ps1 release
+powershell -ExecutionPolicy Bypass -File scripts/build.ps1 all
+```
+
+两套入口是**同义不同源**的：子命令、退出码（0 成功 / 1 失败 / 2 用法错）、磁盘阈值、构建锁
+与清理落点表都对齐，但各按自己语言的习惯实现（`.ps1` 必须存成 UTF-8 带 BOM，否则 PowerShell
+5.1 解码中文常量成乱码；原生命令的退出码只能逐条查 `$LASTEXITCODE`）。共用逻辑不抄两遍：
+版本一致性核对走 `scripts/check-versions.cjs`（`.sh`/`.ps1` 两条打包入口同调一份；扩展名必须
+是 `.cjs`，本仓库 `package.json` 有 `"type": "module"`），构建锁的判活规则走
+`scripts/qs-lock.sh`。锁目录里除 `pid` 还写 `winpid`（Windows 内核 PID）—— Git-Bash 的
+`kill -0` 认不出内核 PID，只按 `pid` 判活的话 `clean.sh` 会看不见 `build.ps1` 正持有的锁
+并把 target 删掉，两个方向现在都锁得住。
+
 `release` 的 bundle 目标集中在 `build.sh` 的 `BUNDLES` 一处：Windows `nsis`，
 macOS `app,dmg`。Tauri 会按宿主自动合并 `src-tauri/tauri.macos.conf.json`
 （`app,dmg` + `LSMinimumSystemVersion 12.0`）—— base `tauri.conf.json` 里的
@@ -84,8 +102,16 @@ bash scripts/clean.sh --yes      # 免确认（非交互环境必须显式带，
 bash scripts/clean.sh --all      # 连 node_modules 一起清（之后需 npm install）
 ```
 
+Windows 上用 PowerShell 跑同一张表（旗标与退出码一致，`-n/-y/-a` 短名同样可用）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/clean.ps1 --dry-run
+powershell -ExecutionPolicy Bypass -File scripts/clean.ps1 --yes
+```
+
 `src-tauri/icons/`、`Cargo.lock`、`package-lock.json` 等已入库文件不会被清理；
 `CARGO_TARGET_DIR` 指向仓库外（Windows 的 `E:/qs-target`）时清单里会标 `⚠ 位于仓库外`。
+有构建正在跑时两个脚本都拒绝删除（见上面的构建锁）。
 
 ### 工具链位置与产物
 

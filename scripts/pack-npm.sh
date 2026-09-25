@@ -14,6 +14,13 @@
 # 产物不入库（npm/.gitignore 已挡）；发布前用 `npm pack --dry-run` 核对文件清单。
 set -euo pipefail
 
+# 与 build.sh 同一条顺序规则：先切到仓库根，再推导任何相对路径。两处都依赖这个顺序 ——
+# 下面非 Windows 宿主的 `CARGO_TARGET_DIR` 默认值取 $PWD，留在 cd 之前会把 target 指到
+# 调用者的目录；而 `$0` 的相对基准在 cd 之后就变了，cd 之后再用 dirname "$0" 去找同目录的
+# check-versions.cjs 会指向不存在的路径（实测：从仓库外以相对路径调用时 MODULE_NOT_FOUND）。
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR/.."
+
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*) HOST=windows ;;
   Darwin) HOST=macos ;;
@@ -34,39 +41,14 @@ else
   export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
 fi
 
-cd "$(dirname "$0")/.."
 VERSION=$(node -p "require('./package.json').version")
 echo "== qoder-switch npm 打包 v${VERSION}（宿主: ${HOST}）=="
 
-# 强制核对版本一致性，任一不符直接终止，防止发错版本包
-node -e "
-  const fs = require('fs');
-  const expected = '$VERSION';
-  const checks = [
-    ['src-tauri/tauri.conf.json', () => require('./src-tauri/tauri.conf.json').version],
-    ['npm/package.json', () => require('./npm/package.json').version],
-    ...fs.readdirSync('npm/platform').map(d => [
-      'npm/platform/' + d + '/package.json',
-      () => require('./npm/platform/' + d + '/package.json').version,
-    ]),
-  ];
-  for (const [f, getV] of checks) {
-    if (getV() !== expected) {
-      console.error(\`版本不一致: \${f} 为 \${getV()}，期望 \${expected}\`);
-      process.exit(1);
-    }
-  }
-  const cargoFiles = ['crates/qs-switch-core/Cargo.toml', 'crates/qs-switch-server/Cargo.toml', 'src-tauri/Cargo.toml'];
-  for (const cf of cargoFiles) {
-    const content = fs.readFileSync(cf, 'utf8');
-    const m = content.match(/^version\s*=\s*\"([^\"]+)\"/m);
-    if (!m || m[1] !== expected) {
-      console.error(\`版本不一致: \${cf} 声明为 \${m ? m[1] : 'null'}，期望 \${expected}\`);
-      process.exit(1);
-    }
-  }
-  console.log(\`所有 \${checks.length + cargoFiles.length} 处版本声明严格一致: \` + expected);
-"
+# 强制核对版本一致性，任一不符直接终止，防止发错版本包。
+# 检查逻辑放在 scripts/check-versions.cjs 里与 pack-npm.ps1 共用 —— 两条打包入口各抄一份
+# 判断，迟早只改一边，而漏掉的那边会发出错版本的包。扩展名必须是 .cjs：本仓库的
+# package.json 写了 "type": "module"，.js 会被 Node 当 ESM 加载而 require 不存在。
+node "$SCRIPT_DIR/check-versions.cjs"
 
 echo "== 1/3 构建 webui 服务端（release）=="
 # rust target → (npm 平台包目录, 二进制文件名)。新增平台只改这张表。

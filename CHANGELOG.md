@@ -31,6 +31,37 @@
     `reveal-app-in-finder` 此前只有桌面宿主有接线，浏览器形态下点这些按钮必然拿
     "未知端点"。现两宿主共用同一个 core 函数，并各加一条回归测试钉住注册表
     （`is_owned` 查询接缝 —— 另两条命令一分发就会真的打开系统设置，不能试跑）。
+- **Windows 原生脚本入口（PowerShell），不再依赖 Git-Bash**：`scripts/build.ps1`、
+  `scripts/clean.ps1`、`scripts/pack-npm.ps1` 与对应的 `.sh` 一一对齐 —— 同一套子命令与
+  旗标（`deps|icons|test|web|debug|release|all`、`-n/--dry-run`、`-y/--yes`、`-a/--all`）、
+  同一张清理落点表、同一把构建锁、同一套磁盘护栏，退出码语义相同（0 成功 / 1 失败 / 2 用法错）。
+  此前 `.sh` 在 Windows 上只能靠 Git-Bash 跑（`uname -s` 命中 `MINGW*` 分支），CI 的
+  windows runner 与只装了 PowerShell 的机器都没有这个前提。
+  - 共用逻辑抽成两份而不是抄两遍：版本一致性核对从 `pack-npm.sh` 的内联 `node -e` 抽到
+    `scripts/check-versions.cjs`（`.sh`/`.ps1` 两条打包入口共用；扩展名必须是 `.cjs`，
+    本仓库 `package.json` 写了 `"type": "module"`，`.js` 会被 Node 当 ESM 加载而没有
+    `require` —— 实测），判活规则抽成 `scripts/qs-lock.sh`。
+  - **顺带修掉一个跨 PID 空间的护栏失效**：Git-Bash 的 PID 与 Windows 内核 PID 是两套编号，
+    `kill -0` 喂给它内核 PID 恒判"进程不存在"（实测 `tasklist` 才查得到）。于是
+    `clean.sh --yes` 面对 `build.ps1` 持有的活锁会返回成功并把几 GB 的 target 删掉 ——
+    正是这道护栏要防的事故。现锁目录除 `pid` 外再写 `winpid`（内核编号；`.sh` 侧由
+    `ps -W` 换算，`.ps1` 侧直接给），读侧一律 `winpid` 优先，`.sh`/`.ps1` 两种入口互相锁得住。
+  - 验证：154 项断言全部在真机上执行通过（沙箱假仓库根 + 假 cargo/rustc/rustup 桩），
+    覆盖 argv 拼装、原生命令退出码回传、锁的活/陈旧判定与跨入口互斥、清理落点表与
+    `.sh` 逐路径对齐、祖先目录硬保护、非交互拒绝、真控制台确认门。过程中抓到两个只在
+    真机暴露的问题：`[System.IO.File]::Length()` 是 .NET Core 才有的重载，PowerShell 5.1
+    上调它必抛且被容错咽掉，导致清理清单每项体积恒显示 0 KB（已改为 FileInfo 实例属性）；
+    `taskkill` 在目标进程不存在时往 stderr 写 ERROR，PS 5.1 在 `Stop` 偏好下会把
+    `2>&1` 的 stderr 行升成终止错误，直接打死 `debug`/`release`（已改走 `cmd /c` 丢弃）。
+  - **修掉三处同类的 `cd` 顺序缺陷**（本轮补 `SCRIPT_DIR` 时只挡住了 `source` 那一处）：
+    `pack-npm.sh` 把版本核对改成调 `check-versions.cjs` 时，路径取的是 `cd` **之后**的
+    `$(dirname "$0")`，从仓库外以相对路径调用（`bash qoder-switch/scripts/pack-npm.sh`）会
+    解析成 `<仓库根>/qoder-switch/scripts/…` 而 MODULE_NOT_FOUND，打包在第一步就中止（实测）；
+    `build.sh` 的 `all` 用 `"$0" deps && …` 递归自己，同一种调用方式是 exit 127（实测）；
+    `pack-npm.sh` 的非 Windows 宿主 `CARGO_TARGET_DIR` 默认值取 `$PWD`，而它写在 `cd` 之前，
+    于是 target 会落到调用者目录 —— 正是 `build.sh` 头部注释里点名踩过的那个坑。
+    现三处统一改走 `cd` 之前算好的绝对 `$SCRIPT_DIR`（`.ps1` 侧用 `$PSScriptRoot` /
+    `$PSCommandPath`，本来就没有这个问题）。
 - **账号库自动备份（把"账号凭空消失"从不可恢复降级成可一键恢复）**：
   每次账号库变动（认领本机账号 / 导入备份 / 扫码登录落包 / 删除账号）都把**整库**
   导出一份到 `<用户文档目录>/QoderSwitch-AccountBackups/`，按文件名时间戳保留最近

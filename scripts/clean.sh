@@ -49,8 +49,10 @@ case "$(uname -s)" in
   *)                    HOST=linux ;;
 esac
 
-cd "$(dirname "$0")/.."
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR/.."
 ROOT="$PWD"
+. "$SCRIPT_DIR/qs-lock.sh"
 
 # 必须是仓库根：防呆，避免在别处误删同名目录。
 for f in Cargo.toml package.json scripts/build.sh; do
@@ -176,18 +178,19 @@ fi
 # 实际是清理与构建交叠。本仓库真实踩过一次：磁盘满 → 删 target 腾空间 →
 # 删除还没落地就跑了 build.sh。
 #
-# 判据用 build.sh 留下的锁，而不是扫进程名：进程名分不清是哪个仓库，而且 cargo 的
+# 判据用构建侧留下的锁，而不是扫进程名：进程名分不清是哪个仓库，而且 cargo 的
 # 命令行里并不含仓库路径（cwd 不在 argv 里），按路径扫必然漏检 —— 那正是最该拦住的
 # 情形。PID 已不存在则视为上次异常退出留下的陈旧锁，放行。
+#
+# 判活走 qs_lock_holder 而不是直接 kill -0：Windows 上锁可能由 build.ps1 持有，它的 PID
+# 是 Windows 内核编号，Git-Bash 的 kill 认不出来（本机实测恒判为"不存在"），于是清理把
+# 正在构建的 target 删掉。规则与加锁侧必须同源，所以两边都调同一个函数。
 BUILD_LOCK="$TARGET_DIR/.qs-build-lock"
-if [ -e "$BUILD_LOCK" ]; then
-  holder="$(cat "$BUILD_LOCK/pid" 2>/dev/null || true)"
-  if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
-    echo "检测到构建正在进行（PID ${holder}），拒绝清理。" >&2
-    echo "边构建边清理会把 target/debug/deps 抽走，让 cargo 报出迷惑性的 ENOENT。" >&2
-    echo "等它结束再重跑本脚本。锁文件：${BUILD_LOCK}" >&2
-    exit 1
-  fi
+if [ -e "$BUILD_LOCK" ] && holder="$(qs_lock_holder "$BUILD_LOCK")"; then
+  echo "检测到构建正在进行（PID ${holder}），拒绝清理。" >&2
+  echo "边构建边清理会把 target/debug/deps 抽走，让 cargo 报出迷惑性的 ENOENT。" >&2
+  echo "等它结束再重跑本脚本。锁文件：${BUILD_LOCK}" >&2
+  exit 1
 fi
 
 # 硬保护：绝不动仓库根、家目录、文件系统根，以及仓库根的任一祖先目录。

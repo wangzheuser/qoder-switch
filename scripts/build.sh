@@ -10,7 +10,10 @@ set -euo pipefail
 # 先切到仓库根，再推导任何相对路径。下面 `CARGO_TARGET_DIR` 的默认值依赖 $PWD，
 # 若把它留在切目录之前求值，从仓库外调用本脚本时 target 会落到调用者的目录去 ——
 # 构建锁与 clean.sh 的 TARGET_DIR 也随之错位，护栏等于失效。
-cd "$(dirname "$0")/.."
+# SCRIPT_DIR 也要在 cd 之前算：cd 之后 `$0` 的相对基准就变了，source 会找不到文件。
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR/.."
+. "$SCRIPT_DIR/qs-lock.sh"
 
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*) HOST=windows ;;
@@ -80,12 +83,13 @@ require_disk() { # $1 = 本次构建实测所需 GB
 #
 # 用环境变量做递归守卫：`all` 会依次调用本脚本的其它子命令，子进程继承该变量后不再加锁，
 # 由最外层持有到整个流程结束。PID 已不存在则视为陈旧锁，直接接管。
+# 判活规则与 clean.sh 共用 qs-lock.sh —— 两边各写一份 kill -0 时，Windows 上认不出
+# build.ps1 写的内核 PID，护栏会静默失效。
 BUILD_LOCK="${CARGO_TARGET_DIR}/.qs-build-lock"
 if [ -z "${QS_BUILD_LOCKED:-}" ]; then
   mkdir -p "$CARGO_TARGET_DIR" 2>/dev/null || true
   if [ -e "$BUILD_LOCK" ]; then
-    holder="$(cat "$BUILD_LOCK/pid" 2>/dev/null || true)"
-    if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+    if holder="$(qs_lock_holder "$BUILD_LOCK")"; then
       echo "已有构建正在进行（PID ${holder}），拒绝并行启动。" >&2
       echo "并行构建会互相踩 target 目录，并让 cargo 报出迷惑性的 ENOENT。" >&2
       exit 1
@@ -93,7 +97,7 @@ if [ -z "${QS_BUILD_LOCKED:-}" ]; then
     rm -rf -- "$BUILD_LOCK"
   fi
   mkdir "$BUILD_LOCK" || { echo "无法创建构建锁: ${BUILD_LOCK}" >&2; exit 1; }
-  echo $$ > "$BUILD_LOCK/pid"
+  qs_lock_write_pid "$BUILD_LOCK" "$$"
   trap 'rm -rf -- "$BUILD_LOCK"' EXIT INT TERM
   export QS_BUILD_LOCKED=1
 fi
@@ -174,7 +178,9 @@ case "${1:-all}" in
   all)
     # debug 与 release 两套 target 都要落地，实测合计约 6GB。
     require_disk 6
-    "$0" deps && "$0" icons && "$0" test && "$0" release
+    # 必须用 $SCRIPT_DIR 而不是 $0：cd 之后 $0 的相对基准已经变了，从仓库外以相对路径
+    # 调用本脚本时这里会 127 找不到文件。build.ps1 的 all 用的是绝对的 $PSCommandPath，同一条规则。
+    "$SCRIPT_DIR/build.sh" deps && "$SCRIPT_DIR/build.sh" icons && "$SCRIPT_DIR/build.sh" test && "$SCRIPT_DIR/build.sh" release
     ;;
   *)
     echo "用法: $0 [deps|icons|test|web|debug|release|all]（当前宿主: ${HOST}，bundles: ${BUNDLES}）" >&2
