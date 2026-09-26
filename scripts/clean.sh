@@ -60,19 +60,17 @@ for f in Cargo.toml package.json scripts/build.sh; do
 done
 
 # cargo target 目录的推导必须与 build.sh 完全同源 —— 连"没导出环境变量时的缺省值"也算，
-# 否则清了半天没清到真正的构建目录。Windows 上 build.sh 把 target 钉在 E:/qs-target
-# （C: 盘装不下一次 release 的 target），这边只认环境变量的话：没导出时列出来的是根本不
-# 存在的 $ROOT/target（1.87 GB 的本体留在原地没删），而下面按 TARGET_DIR 定位的构建锁也
-# 跟着查错路径 —— "边构建边清理"那道保护会整个失效。多清一个不存在的路径是无害的，
-# 少清才是问题。
-if [ "$HOST" = windows ]; then
-  TARGET_DIR="${CARGO_TARGET_DIR:-E:/qs-target}"
-  # MSYS 下 Windows 形式的路径要转成 POSIX 路径，才能 du/rm。
-  if command -v cygpath >/dev/null 2>&1; then
-    TARGET_DIR="$(cygpath -u "$TARGET_DIR")"
-  fi
-else
-  TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
+# 否则清了半天没清到真正的构建目录；而下面按 TARGET_DIR 定位的构建锁也会跟着查错路径，
+# "边构建边清理"那道保护整个失效。多清一个不存在的路径是无害的，少清才是问题。
+#
+# 缺省值在三端都是仓库内的 target/（cargo 自己的缺省，也是 CI runner 拿到的那个）。
+# 曾有一段时间 Windows 侧钉在 E:/qs-target（C: 盘装不下）；现在两端的构建与清理都收
+# 到这一条规则上，那个旧落点不再被扫描 —— 老机器上若还留着它，手动删一次即可。
+TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
+# MSYS 下 Windows 形式的路径（用户显式导出的 CARGO_TARGET_DIR 常见）要转成 POSIX 路径
+# 才能 du/rm；本来就是 POSIX 形式的传过去不变，非 Windows 宿主没有 cygpath 就跳过。
+if [ "$HOST" = windows ] && command -v cygpath >/dev/null 2>&1; then
+  TARGET_DIR="$(cygpath -u "$TARGET_DIR")"
 fi
 case "$TARGET_DIR" in
   /*) ;;

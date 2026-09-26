@@ -27,10 +27,13 @@ case "$(uname -s)" in
   *) HOST=linux ;;
 esac
 
+# target 缺省与 build.sh 同源（仓库内 target/），否则这里去找 cargo 产物会指错目录。
 if [ "$HOST" = windows ]; then
   export RUSTUP_HOME="${RUSTUP_HOME:-E:/rustup}"
   export CARGO_HOME="${CARGO_HOME:-E:/cargo}"
-  export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-E:/qs-target}"
+  # 同 build.sh：Windows 上要给 cargo 盘符形式，用 -m 取正斜杠形状。
+  qs_root="$(cygpath -m "$PWD" 2>/dev/null || echo "$PWD")"
+  export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$qs_root/target}"
 else
   export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target}"
 fi

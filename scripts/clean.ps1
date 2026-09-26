@@ -62,14 +62,15 @@ foreach ($f in @('Cargo.toml', 'package.json', 'scripts/build.sh')) {
     }
 }
 
-# cargo target 目录的推导必须与构建脚本同源，否则清了半天没清到真正的构建目录。
-# 缺省值两边现在一致（clean.sh 以前只认环境变量，Windows 上没导出时会去清根本不存在的
-# $Root\target，1.87 GB 的本体留在原地，构建锁也查错路径）：Windows 上构建侧把 target
-# 钉在 E:\qs-target，本入口又只在 Windows 上跑，所以缺省同一个值。
+# cargo target 目录的推导必须与构建脚本同源，否则清了半天没清到真正的构建目录，
+# 而下面按 $TargetDir 定位的构建锁也会查错路径 —— "边构建边清理"那道保护整个失效。
+# 缺省值三端都是仓库内的 target\（cargo 自己的缺省，也是 CI runner 拿到的那个）。
+# 曾有一段时间 Windows 侧钉在 E:\qs-target（C: 盘装不下）；现在构建与清理都收到这一条
+# 规则上，那个旧落点不再被扫描 —— 老机器上若还留着它，手动删一次即可。
 if ($env:CARGO_TARGET_DIR) {
     $TargetDir = [System.IO.Path]::GetFullPath($env:CARGO_TARGET_DIR)
 } else {
-    $TargetDir = 'E:\qs-target'
+    $TargetDir = Join-Path $Root 'target'
 }
 if (-not [System.IO.Path]::IsPathRooted($TargetDir)) { $TargetDir = Join-Path $Root $TargetDir }
 $RepoTarget = Join-Path $Root 'target'

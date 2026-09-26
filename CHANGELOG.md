@@ -118,6 +118,25 @@
   - 列表改为最新在前，并删掉前端那次 `.reverse()`：此前它把后端已经排好序的"新的在前"
     又倒过来，配合 `max-h-64` 的滚动容器，打开永远看到的是最旧的三条。
 
+### 变更
+- **构建产物目录的缺省落点改回仓库内 `target/`，三端同一条规则**：Windows 分支此前把
+  `CARGO_TARGET_DIR` 钉在 `E:/qs-target`，理由很具体 —— 那台开发机的 C: 盘装不下约 7 GB
+  的 release target。但这个钉法有三个代价：① 仓库在哪块盘本该由用户决定，脚本替他定了；
+  ② 一个平台一个落点，`clean.*` 与 `build.*` 必须在两宿主间手工对齐（上一轮就是为这个
+  补的 bug —— 缺省值不同源导致 `.sh` 侧构建锁查错路径，"边构建边清理"的护栏静默失效）；
+  ③ 与 cargo 自己的缺省、与 CI runner 拿到的落点都不一致。现四个脚本
+  （`build.sh` / `build.ps1` / `pack-npm.sh` / `pack-npm.ps1`）与两个清理入口的缺省值
+  统一为 `<仓库根>/target`，环境变量给了就照给的语义不变。
+  - 路径长度实测过：换更长的前缀（`E:\qs-target` → 仓库内 `target`，多 35 字符）后，
+    上一次真实 release 产物里的最长路径 152 → 约 187，仍在 260 的 `MAX_PATH` 内；
+    本机 `LongPathsEnabled=1`。
+  - Git-Bash 侧新增一处必要的形式转换：缺省值必须给 cargo 盘符形式（`cargo.exe` 是原生
+    程序，MSYS 不转换 `CARGO_TARGET_DIR` 这类非 PATH 变量，`/e/...` 会被解析成当前盘符下
+    的相对路径），用 `cygpath -m` 取 `E:/…/target` 这种正斜杠形状 —— cargo 认，脚本自己的
+    构建锁路径也认（锁目录建在 target 里面，反斜杠形式在 MSYS 的 `mkdir`/`rm` 下不可靠）。
+  - **旧落点需要手动清一次**：`E:/qs-target` 之类的仓库外目录不再被清理脚本扫描，本机
+    实测遗留 1.7 GB。
+
 ### 缺陷修复
 - **签到日志的 JSON 键名与前端契约不符，导致账号列没有任何回落余地**：`CheckinLogEntry`
   没有 `rename_all`，落盘是 `account_id`，而 `src/lib/types.ts` 的 `CheckinLog` 声明的是

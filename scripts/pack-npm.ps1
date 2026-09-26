@@ -43,9 +43,11 @@ function Invoke-Step {
 Set-Location (Split-Path -Parent $PSScriptRoot)
 $Root = (Get-Location).Path
 
+# target 缺省与 build.ps1 / pack-npm.sh 同源（仓库内 target\），否则这里去找 cargo 产物
+# 会指错目录。Windows 侧曾钉在 E:\qs-target，那个旧落点不再被扫描。
 if (-not $env:RUSTUP_HOME) { $env:RUSTUP_HOME = 'E:\rustup' }
 if (-not $env:CARGO_HOME) { $env:CARGO_HOME = 'E:\cargo' }
-if (-not $env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR = 'E:\qs-target' }
+if (-not $env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR = Join-Path $Root 'target' }
 $env:CARGO_TARGET_DIR = [System.IO.Path]::GetFullPath($env:CARGO_TARGET_DIR)
 
 $CargoBin = Join-Path $env:CARGO_HOME 'bin'

@@ -9,8 +9,8 @@
 # （uname/cygpath/taskkill// 转义），CI 的 windows-latest runner 与只想用
 # PowerShell 的同事都不该被要求先装 Git-Bash。
 #
-# 工具链与产物位置钉在 E:（C: 盘装不下一次 release target，实测约 7GB），
-# 与 build.sh 取同一组默认值；已有环境变量一律优先。
+# 工具链缺省钉在 E:（那台开发机的 rustup 装在那儿），与 build.sh 取同一组默认值；已有
+# 环境变量一律优先。产物目录三端都是仓库内的 target\，不再另钉到别处。
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
@@ -57,9 +57,12 @@ function Invoke-Step {
 Set-Location (Split-Path -Parent $PSScriptRoot)
 $Root = (Get-Location).Path
 
+# target 三端一条规则：仓库内的 target\ —— cargo 自己的缺省，也是 CI runner 拿到的那个。
+# Windows 侧曾钉在 E:\qs-target（那台开发机的 C: 盘装不下），现已与 build.sh / clean.*
+# 统一；那个旧落点不再被扫描，老机器上手删一次即可。
 if (-not $env:RUSTUP_HOME) { $env:RUSTUP_HOME = 'E:\rustup' }
 if (-not $env:CARGO_HOME) { $env:CARGO_HOME = 'E:\cargo' }
-if (-not $env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR = 'E:\qs-target' }
+if (-not $env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR = Join-Path $Root 'target' }
 
 # 绝对化，后面与 $Root 比较时才有同一形状。
 $env:CARGO_TARGET_DIR = [System.IO.Path]::GetFullPath($env:CARGO_TARGET_DIR)

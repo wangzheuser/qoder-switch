@@ -52,9 +52,9 @@ information stored in 'Qoder CN App Safe Storage'"）。请选**「始终允许�
 
 ## 构建
 
-Windows 侧把工具链与产物钉在 E:（C: 盘余量不足，一次 release target 实测吃掉约 7GB），
-macOS/Linux 侧用默认工具链位置、产物落 `./target`。这些分叉都在 `scripts/build.sh` 里
-按 `uname -s` 判定，不需要记环境变量：
+Windows 侧把工具链缺省钉在 E:（那台开发机的 rustup 装在那儿），产物目录三端一致，都是仓库
+根下的 `target/`。工具链那部分分叉在 `scripts/build.sh` 里按 `uname -s` 判定，不需要记
+环境变量：
 
 ```bash
 bash scripts/build.sh deps      # npm install
@@ -126,8 +126,8 @@ powershell -ExecutionPolicy Bypass -File scripts/clean.ps1 --yes
 ```
 
 `src-tauri/icons/`、`Cargo.lock`、`package-lock.json` 等已入库文件不会被清理；target 落点与
-构建侧同源推导（Windows 上即使没导出 `CARGO_TARGET_DIR` 也按缺省的 `E:/qs-target` 清，
-而不是去清一个根本不存在的 `./target`），落在仓库外时清单里会标 `⚠ 位于仓库外`。
+构建侧同源推导（三端缺省都是仓库内的 `target/`，两侧规则逐字符相同，不存在"构建写到 A、
+清理去删 B"），落在仓库外时（你显式导出了 `CARGO_TARGET_DIR`）清单里会标 `⚠ 位于仓库外`。
 有构建正在跑时两个脚本都拒绝删除（见上面的构建锁）。
 
 ### 工具链位置与产物
@@ -137,7 +137,12 @@ Windows 上 `RUSTUP_HOME` / `CARGO_HOME` 若不在默认位置，脚本会读环
 源替换，否则拉索引会超时。GitHub Actions 的 runner 没有 E: 盘，所以这些钉法只写在
 `build.sh` 里、且只在 Windows 分支生效，不进 `.cargo/config.toml`。
 
-产物目录（`$CARGO_TARGET_DIR`，Windows 上是 `E:/qs-target`，macOS/Linux 上是 `./target`）：
+产物目录三端同一条规则：`$CARGO_TARGET_DIR`，没导出时取 **仓库根下的 `target/`** ——
+就是 cargo 自己的缺省，也是 CI runner 拿到的那个。曾经 Windows 分支把它钉在
+`E:/qs-target`（那台开发机的 C: 盘装不下约 7 GB 的 release target），但"仓库在哪块盘"
+不该由脚本来替用户决定，且一个平台一个落点会让 clean 与构建在两宿主间对不上号。
+系统盘吃紧就自己 `export CARGO_TARGET_DIR=<别处>`，四个脚本（`build.*` / `clean.*` /
+`pack-npm.*`）都跟随它。产物位置（相对 `$CARGO_TARGET_DIR`）：
 
 | | Windows | macOS |
 | --- | --- | --- |

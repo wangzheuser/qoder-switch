@@ -21,11 +21,18 @@ case "$(uname -s)" in
   *) HOST=linux ;;
 esac
 
+# target 三端只有一条规则：仓库内的 target/ —— cargo 自己的缺省，也是 CI runner 拿到的
+# 那个。以前 Windows 侧钉在 E:/qs-target（那台开发机的 C: 盘装不下），但"仓库在哪块盘"
+# 本就不该由脚本替用户决定，钉死还让 clean 与构建在两宿主间对不上号。
 if [ "$HOST" = windows ]; then
   export RUSTUP_HOME="${RUSTUP_HOME:-E:/rustup}"
   export CARGO_HOME="${CARGO_HOME:-E:/cargo}"
-  # target-dir 由 .cargo/config.toml 兜底；这里显式覆盖以防 env 里有残留值。
-  export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-E:/qs-target}"
+  # 值必须是 Windows 盘符形式：cargo.exe 是原生程序，MSYS 不转换 CARGO_TARGET_DIR 这类
+  # 非 PATH 变量，传 /e/... 会被它解析成"当前盘符下的相对路径"。`-m` 给的是
+  # `E:/…` 这种正斜杠形状 —— cargo 认，MSYS 的 mkdir/rm 也认（下面的构建锁就建在它下面，
+  # 反斜杠形式在 MSYS 里并不可靠），clean 两侧再各自按宿主规范化。
+  qs_root="$(cygpath -m "$PWD" 2>/dev/null || echo "$PWD")"
+  export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$qs_root/target}"
   EXE=.exe
 else
   # 非 Windows 宿主不覆盖 rustup/cargo 的默认位置；只给 target 一个默认值。
