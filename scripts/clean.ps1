@@ -63,9 +63,9 @@ foreach ($f in @('Cargo.toml', 'package.json', 'scripts/build.sh')) {
 }
 
 # cargo target 目录的推导必须与构建脚本同源，否则清了半天没清到真正的构建目录。
-# 与 clean.sh 的唯一差别在缺省值：.sh 那边只认环境变量，而 Windows 上构建侧的默认位置是
-# E:\qs-target，没导出环境变量时 .sh 会漏掉真正吃空间的那个目录（多清一个不存在的路径
-# 是无害的，少清才是问题）。
+# 缺省值两边现在一致（clean.sh 以前只认环境变量，Windows 上没导出时会去清根本不存在的
+# $Root\target，1.87 GB 的本体留在原地，构建锁也查错路径）：Windows 上构建侧把 target
+# 钉在 E:\qs-target，本入口又只在 Windows 上跑，所以缺省同一个值。
 if ($env:CARGO_TARGET_DIR) {
     $TargetDir = [System.IO.Path]::GetFullPath($env:CARGO_TARGET_DIR)
 } else {

@@ -501,6 +501,8 @@ pub fn auth_permission_probe(roots: &PathRoots, v: QoderVariant) -> Value {
         Ok(()) => {
             // 探针写完即删；删除失败不影响"可写"这个结论，但要记下来。
             let rm = std::fs::remove_file(&probe);
+            // mut 只在下面的 mac 分支里被 push_str 用到，其它宿主上是 unused_mut 告警。
+            #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
             let mut message = if rm.is_ok() {
                 "认证目录可写，权限正常".to_string()
             } else {

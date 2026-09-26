@@ -59,11 +59,20 @@ for f in Cargo.toml package.json scripts/build.sh; do
   [ -f "$f" ] || { echo "当前目录不像 qoder-switch 仓库根（缺 ${f}）: ${ROOT}" >&2; exit 1; }
 done
 
-# cargo target 目录的推导必须与 build.sh 完全同源，否则清了半天没清到真正的构建目录。
-TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
-if [ "$HOST" = windows ] && command -v cygpath >/dev/null 2>&1; then
-  # Windows 上 build.sh 会把 target 钉在 E:（形如 E:/qs-target），MSYS 下要转成 POSIX 路径。
-  TARGET_DIR="$(cygpath -u "$TARGET_DIR")"
+# cargo target 目录的推导必须与 build.sh 完全同源 —— 连"没导出环境变量时的缺省值"也算，
+# 否则清了半天没清到真正的构建目录。Windows 上 build.sh 把 target 钉在 E:/qs-target
+# （C: 盘装不下一次 release 的 target），这边只认环境变量的话：没导出时列出来的是根本不
+# 存在的 $ROOT/target（1.87 GB 的本体留在原地没删），而下面按 TARGET_DIR 定位的构建锁也
+# 跟着查错路径 —— "边构建边清理"那道保护会整个失效。多清一个不存在的路径是无害的，
+# 少清才是问题。
+if [ "$HOST" = windows ]; then
+  TARGET_DIR="${CARGO_TARGET_DIR:-E:/qs-target}"
+  # MSYS 下 Windows 形式的路径要转成 POSIX 路径，才能 du/rm。
+  if command -v cygpath >/dev/null 2>&1; then
+    TARGET_DIR="$(cygpath -u "$TARGET_DIR")"
+  fi
+else
+  TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
 fi
 case "$TARGET_DIR" in
   /*) ;;
@@ -103,7 +112,7 @@ record_glob() { # $1 = 说明，$2 = 含通配符的模式
 # ── cargo / tauri 构建目录 ────────────────────────────────────────────────────
 record "cargo/tauri 构建目录（含 release bundle、增量与依赖缓存）" "$TARGET_DIR"
 if [ "$TARGET_DIR" != "$ROOT/target" ]; then
-  record "cargo 构建目录（仓库内默认位置，环境变量指向了别处）" "$ROOT/target"
+  record "cargo 构建目录（仓库内默认位置，本次落点指向了别处）" "$ROOT/target"
 fi
 record "tauri 旧布局构建目录" "$ROOT/src-tauri/target"
 

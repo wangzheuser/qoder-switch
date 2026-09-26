@@ -125,8 +125,9 @@ powershell -ExecutionPolicy Bypass -File scripts/clean.ps1 --dry-run
 powershell -ExecutionPolicy Bypass -File scripts/clean.ps1 --yes
 ```
 
-`src-tauri/icons/`、`Cargo.lock`、`package-lock.json` 等已入库文件不会被清理；
-`CARGO_TARGET_DIR` 指向仓库外（Windows 的 `E:/qs-target`）时清单里会标 `⚠ 位于仓库外`。
+`src-tauri/icons/`、`Cargo.lock`、`package-lock.json` 等已入库文件不会被清理；target 落点与
+构建侧同源推导（Windows 上即使没导出 `CARGO_TARGET_DIR` 也按缺省的 `E:/qs-target` 清，
+而不是去清一个根本不存在的 `./target`），落在仓库外时清单里会标 `⚠ 位于仓库外`。
 有构建正在跑时两个脚本都拒绝删除（见上面的构建锁）。
 
 ### 工具链位置与产物

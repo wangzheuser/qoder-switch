@@ -71,6 +71,18 @@
     双字节配对并吞掉紧随的 ASCII 字节，注释行会碎成命令执行（实测报 `'的' is not recognized`）
     —— 与 `.ps1` 反过来必须带 UTF-8 BOM 正好相反。另注意 cmd 里 `./build.bat` 也不认，
     斜杠被当开关，得写 `build.bat` 或 `.\build.bat`。
+  - **修掉 `clean.sh` 在 Windows 上清不到真正的构建目录**（上面那句"清理落点表逐路径对齐"
+    其实漏了**缺省值**这一格）：`.sh` 侧 `TARGET_DIR` 只认 `CARGO_TARGET_DIR`，没导出时缺省成
+    `$ROOT/target`，而 Windows 构建侧的缺省落点是钉在 E: 的 `E:/qs-target`。本机实测同一时刻
+    `clean.ps1 --dry-run` 报 4 项 / 1.87 GB，`clean.sh --dry-run` 只报 3 项 / 2.4 MB ——
+    跑完 `.sh` 那个吃空间的大头原地不动。更要紧的是构建锁按 `TARGET_DIR` 定位，路径一错，
+    "有构建在跑就拒绝删除"这道护栏在 `.sh` 侧整个失效（锁在 `E:/qs-target` 下，它去查
+    `$ROOT/target`，永远查不到）。现两入口按同一规则推导缺省值，并实测：活锁在缺省落点上
+    两入口都拒绝（exit 1）、`CARGO_TARGET_DIR` 覆盖时清单同源、撤锁后 `.sh` 真删仓库外那项。
+  - 顺手清掉一个只在非 mac 宿主出现的 `unused_mut` 构建告警：`view::auth_permission_probe`
+    里 `message` 的 `mut` 只被 `#[cfg(target_os = "macos")]` 分支的 `push_str` 用到，
+    改 `#[cfg_attr(not(target_os = "macos"), allow(unused_mut))]` —— mac 上仍需 `mut`，
+    Windows/Linux 上不再刷告警。
 - **账号库自动备份（把"账号凭空消失"从不可恢复降级成可一键恢复）**：
   每次账号库变动（认领本机账号 / 导入备份 / 扫码登录落包 / 删除账号）都把**整库**
   导出一份到 `<用户文档目录>/QoderSwitch-AccountBackups/`，按文件名时间戳保留最近
