@@ -31,6 +31,58 @@
     `reveal-app-in-finder` 此前只有桌面宿主有接线，浏览器形态下点这些按钮必然拿
     "未知端点"。现两宿主共用同一个 core 函数，并各加一条回归测试钉住注册表
     （`is_owned` 查询接缝 —— 另两条命令一分发就会真的打开系统设置，不能试跑）。
+- **Windows 原生脚本入口（PowerShell），不再依赖 Git-Bash**：`scripts/build.ps1`、
+  `scripts/clean.ps1`、`scripts/pack-npm.ps1` 与对应的 `.sh` 一一对齐 —— 同一套子命令与
+  旗标（`deps|icons|test|web|debug|release|all`、`-n/--dry-run`、`-y/--yes`、`-a/--all`）、
+  同一张清理落点表、同一把构建锁、同一套磁盘护栏，退出码语义相同（0 成功 / 1 失败 / 2 用法错）。
+  此前 `.sh` 在 Windows 上只能靠 Git-Bash 跑（`uname -s` 命中 `MINGW*` 分支），CI 的
+  windows runner 与只装了 PowerShell 的机器都没有这个前提。
+  - 共用逻辑抽成两份而不是抄两遍：版本一致性核对从 `pack-npm.sh` 的内联 `node -e` 抽到
+    `scripts/check-versions.cjs`（`.sh`/`.ps1` 两条打包入口共用；扩展名必须是 `.cjs`，
+    本仓库 `package.json` 写了 `"type": "module"`，`.js` 会被 Node 当 ESM 加载而没有
+    `require` —— 实测），判活规则抽成 `scripts/qs-lock.sh`。
+  - **顺带修掉一个跨 PID 空间的护栏失效**：Git-Bash 的 PID 与 Windows 内核 PID 是两套编号，
+    `kill -0` 喂给它内核 PID 恒判"进程不存在"（实测 `tasklist` 才查得到）。于是
+    `clean.sh --yes` 面对 `build.ps1` 持有的活锁会返回成功并把几 GB 的 target 删掉 ——
+    正是这道护栏要防的事故。现锁目录除 `pid` 外再写 `winpid`（内核编号；`.sh` 侧由
+    `ps -W` 换算，`.ps1` 侧直接给），读侧一律 `winpid` 优先，`.sh`/`.ps1` 两种入口互相锁得住。
+  - 验证：154 项断言全部在真机上执行通过（沙箱假仓库根 + 假 cargo/rustc/rustup 桩），
+    覆盖 argv 拼装、原生命令退出码回传、锁的活/陈旧判定与跨入口互斥、清理落点表与
+    `.sh` 逐路径对齐、祖先目录硬保护、非交互拒绝、真控制台确认门。过程中抓到两个只在
+    真机暴露的问题：`[System.IO.File]::Length()` 是 .NET Core 才有的重载，PowerShell 5.1
+    上调它必抛且被容错咽掉，导致清理清单每项体积恒显示 0 KB（已改为 FileInfo 实例属性）；
+    `taskkill` 在目标进程不存在时往 stderr 写 ERROR，PS 5.1 在 `Stop` 偏好下会把
+    `2>&1` 的 stderr 行升成终止错误，直接打死 `debug`/`release`（已改走 `cmd /c` 丢弃）。
+  - **修掉三处同类的 `cd` 顺序缺陷**（本轮补 `SCRIPT_DIR` 时只挡住了 `source` 那一处）：
+    `pack-npm.sh` 把版本核对改成调 `check-versions.cjs` 时，路径取的是 `cd` **之后**的
+    `$(dirname "$0")`，从仓库外以相对路径调用（`bash qoder-switch/scripts/pack-npm.sh`）会
+    解析成 `<仓库根>/qoder-switch/scripts/…` 而 MODULE_NOT_FOUND，打包在第一步就中止（实测）；
+    `build.sh` 的 `all` 用 `"$0" deps && …` 递归自己，同一种调用方式是 exit 127（实测）；
+    `pack-npm.sh` 的非 Windows 宿主 `CARGO_TARGET_DIR` 默认值取 `$PWD`，而它写在 `cd` 之前，
+    于是 target 会落到调用者目录 —— 正是 `build.sh` 头部注释里点名踩过的那个坑。
+    现三处统一改走 `cd` 之前算好的绝对 `$SCRIPT_DIR`（`.ps1` 侧用 `$PSScriptRoot` /
+    `$PSCommandPath`，本来就没有这个问题）。
+  - **`scripts/build.bat`：cmd.exe 启动器**。此前在 cmd 里跑构建只有
+    `powershell -File scripts\build.ps1 …` 一条长命令：cmd 不认 `.\build.ps1`
+    （报 `'.' is not recognized as an internal or external command`），裸敲 `build.ps1`
+    则取决于机器的 `.ps1` 文件关联与执行策略。`build.bat` 只起一个显式 PowerShell 宿主并
+    透传参数与退出码（实测 0/1/2 三级都能原样穿回 cmd）。
+    **该文件必须纯 ASCII**：cmd 按 OEM 代码页（本机 936）读批处理，UTF-8 中文会被当 GBK
+    双字节配对并吞掉紧随的 ASCII 字节，注释行会碎成命令执行（实测报 `'的' is not recognized`）
+    —— 与 `.ps1` 反过来必须带 UTF-8 BOM 正好相反。另注意 cmd 里 `./build.bat` 也不认，
+    斜杠被当开关，得写 `build.bat` 或 `.\build.bat`。
+  - **修掉 `clean.sh` 在 Windows 上清不到真正的构建目录**（上面那句"清理落点表逐路径对齐"
+    其实漏了**缺省值**这一格）：`.sh` 侧 `TARGET_DIR` 只认 `CARGO_TARGET_DIR`，没导出时缺省成
+    `$ROOT/target`，而 Windows 构建侧的缺省落点是钉在 E: 的 `E:/qs-target`。本机实测同一时刻
+    `clean.ps1 --dry-run` 报 4 项 / 1.87 GB，`clean.sh --dry-run` 只报 3 项 / 2.4 MB ——
+    跑完 `.sh` 那个吃空间的大头原地不动。更要紧的是构建锁按 `TARGET_DIR` 定位，路径一错，
+    "有构建在跑就拒绝删除"这道护栏在 `.sh` 侧整个失效（锁在 `E:/qs-target` 下，它去查
+    `$ROOT/target`，永远查不到）。现两入口按同一规则推导缺省值，并实测：活锁在缺省落点上
+    两入口都拒绝（exit 1）、`CARGO_TARGET_DIR` 覆盖时清单同源、撤锁后 `.sh` 真删仓库外那项。
+  - 顺手清掉一个只在非 mac 宿主出现的 `unused_mut` 构建告警：`view::auth_permission_probe`
+    里 `message` 的 `mut` 只被 `#[cfg(target_os = "macos")]` 分支的 `push_str` 用到，
+    改 `#[cfg_attr(not(target_os = "macos"), allow(unused_mut))]` —— mac 上仍需 `mut`，
+    Windows/Linux 上不再刷告警。
 - **账号库自动备份（把"账号凭空消失"从不可恢复降级成可一键恢复）**：
   每次账号库变动（认领本机账号 / 导入备份 / 扫码登录落包 / 删除账号）都把**整库**
   导出一份到 `<用户文档目录>/QoderSwitch-AccountBackups/`，按文件名时间戳保留最近
@@ -48,8 +100,51 @@
   - 默认入口 `export_import::auto_backup_default` **只认真实账号库**
     （`store == switch_root()`），沙箱 store 一律返回 `None` ——
     避免跑一次测试就往用户的文档目录里写凭据副本（有测试钉死这条契约）。
+- **签到日志补上「哪个账号 / 领到多少 / 余额怎么变」**：设置页那条日志此前只有状态与时间，
+  账号列渲染的是 `email`，而国内版桌面登录态里 `user.email` 常年为空 —— 实测本机三条日志
+  `email` 全为 `""`，于是整行左边什么都没有，用户只能看到三个"签到成功"。
+  - 展示名统一走 `ledger::account_label`：`email → 账号包里的 email/name/uid → accountId`。
+    口径与账号卡（`nickname||email||uid||id`）和统计事件一致，不再三处各抄一遍。
+  - 新增 `claimed`（本次领到的 Credits）：这个数 `checkin()` 早就从 claim 响应的
+    `benefit.amount` 汇总出来并回给前端了，只差没落盘。`already`/`error` 用 `None` 而不是 0
+    —— 0 会被读成"领到了 0 分"；前端 `already` 明确写「未新增积分」而不是留白让人猜。
+  - 新增 `remainingBefore` / `remainingAfter`（签到前后余额）。before 取该账号最近一条配额
+    快照，零网络成本（代价是最多 10 分钟的快照节流滞后，字段注释里写明了）；after 在领取
+    成功后复查一次配额，**每账号每天一次额外请求，只走成功分支** —— 换来的正是"确实到账"的
+    正面证据，与 `CLAIMED` 那次修的"把没证据的状态折叠成好消息"同源。复查失败就留空，
+    不拿旧值冒充。
+  - 读取侧补 `accountGone`：账号包后来被删的日志行标「已不在库中」；`local-*` 是桌面现场
+    账号的合成 id，本来就没有包，绝不能打这个标（有测试钉住这一侧）。
+  - 列表改为最新在前，并删掉前端那次 `.reverse()`：此前它把后端已经排好序的"新的在前"
+    又倒过来，配合 `max-h-64` 的滚动容器，打开永远看到的是最旧的三条。
+
+### 变更
+- **构建产物目录的缺省落点改回仓库内 `target/`，三端同一条规则**：Windows 分支此前把
+  `CARGO_TARGET_DIR` 钉在 `E:/qs-target`，理由很具体 —— 那台开发机的 C: 盘装不下约 7 GB
+  的 release target。但这个钉法有三个代价：① 仓库在哪块盘本该由用户决定，脚本替他定了；
+  ② 一个平台一个落点，`clean.*` 与 `build.*` 必须在两宿主间手工对齐（上一轮就是为这个
+  补的 bug —— 缺省值不同源导致 `.sh` 侧构建锁查错路径，"边构建边清理"的护栏静默失效）；
+  ③ 与 cargo 自己的缺省、与 CI runner 拿到的落点都不一致。现四个脚本
+  （`build.sh` / `build.ps1` / `pack-npm.sh` / `pack-npm.ps1`）与两个清理入口的缺省值
+  统一为 `<仓库根>/target`，环境变量给了就照给的语义不变。
+  - 路径长度实测过：换更长的前缀（`E:\qs-target` → 仓库内 `target`，多 35 字符）后，
+    上一次真实 release 产物里的最长路径 152 → 约 187，仍在 260 的 `MAX_PATH` 内；
+    本机 `LongPathsEnabled=1`。
+  - Git-Bash 侧新增一处必要的形式转换：缺省值必须给 cargo 盘符形式（`cargo.exe` 是原生
+    程序，MSYS 不转换 `CARGO_TARGET_DIR` 这类非 PATH 变量，`/e/...` 会被解析成当前盘符下
+    的相对路径），用 `cygpath -m` 取 `E:/…/target` 这种正斜杠形状 —— cargo 认，脚本自己的
+    构建锁路径也认（锁目录建在 target 里面，反斜杠形式在 MSYS 的 `mkdir`/`rm` 下不可靠）。
+  - **旧落点需要手动清一次**：`E:/qs-target` 之类的仓库外目录不再被清理脚本扫描，本机
+    实测遗留 1.7 GB。
 
 ### 缺陷修复
+- **签到日志的 JSON 键名与前端契约不符，导致账号列没有任何回落余地**：`CheckinLogEntry`
+  没有 `rename_all`，落盘是 `account_id`，而 `src/lib/types.ts` 的 `CheckinLog` 声明的是
+  `accountId` —— 前端读回来恒为 `undefined`，所以 `email` 为空时连"退化成显示账号 id"都做不到
+  （`email` 为空是常态，见上一条）。现补 `#[serde(rename_all = "camelCase")]`，并给
+  `account_id` 加 `alias`，让已落盘的老日志不迁移也能读回（新增测试用一份手写旧格式文件
+  钉住这条兼容）。连带 `ledger.rs` 里那句 `l["accountId"] != "acct-old"` 从**恒真的空断言**
+  （键根本不存在，`Null != "acct-old"`）变成真的能钉住裁剪行为。
 - **`launcher_exe` 在 POSIX 路径下恒为 `None`**：目录前缀比较无条件 `push('\\')`，
   mac 上规范化路径永不匹配，导致自动重启被静默降级成"请手动打开"。改为按宿主分隔符。
 - **updater 清单平台键与 Tauri 不一致**：`core::update` 曾请求 `latest-macos-<arch>.json`，

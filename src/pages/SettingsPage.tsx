@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type ReactElement, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactElement, type ReactNode } from "react";
 import { ArrowUpCircle, CircleCheck, ExternalLink, Loader2, RefreshCw, Save } from "lucide-react";
 import { toast } from "sonner";
 
@@ -123,6 +123,36 @@ function logLabel(result: string): { text: string; tone: "success" | "warning" |
   }
 }
 
+/** 积分数字：后端给的是 f64，直接渲染会出现 120.000000001；整数不带小数。 */
+function fmtCredits(n: number): string {
+  return Number.isInteger(n) ? String(n) : n.toFixed(1);
+}
+
+/**
+ * 一行签到日志的账号名。后端已按 `email → 包里的 email/name/uid → accountId` 兜底，
+ * 这里只兜历史数据 —— 老日志没有 `accountName`，而 email 在国内版登录态里常年是空的，
+ * 于是整行左侧空白（就是这次要修的那个现场）。
+ */
+function logAccountName(l: CheckinLog): string {
+  return l.accountName || l.email || l.accountId || "未知账号";
+}
+
+/** 收益列：success 才可能有数字；already 明确写"未新增"，而不是留白让人猜有没有领到。 */
+function logGain(l: CheckinLog): { text: string; tone: "gain" | "muted" } | null {
+  if (l.result === "success") {
+    const parts: string[] = [];
+    if (typeof l.claimed === "number") parts.push(`+${fmtCredits(l.claimed)} Credits`);
+    if (typeof l.remainingBefore === "number" && typeof l.remainingAfter === "number") {
+      parts.push(`余额 ${fmtCredits(l.remainingBefore)} → ${fmtCredits(l.remainingAfter)}`);
+    } else if (typeof l.remainingAfter === "number") {
+      parts.push(`余额 ${fmtCredits(l.remainingAfter)}`);
+    }
+    return parts.length ? { text: parts.join(" · "), tone: "gain" } : null;
+  }
+  if (l.result === "already") return { text: "未新增积分", tone: "muted" };
+  return null;
+}
+
 /** 自动签到配置 + 一键签到 + 日志。 */
 function AutoCheckinCard() {
   const [cfg, setCfg] = useState<CheckinConfig | null>(null);
@@ -166,7 +196,16 @@ function AutoCheckinCard() {
     }
   }
 
+  /**
+   * 同步防重入：`busy` 是异步 state，同一帧内连点两次仍会触发两次并发请求。
+   * 后端虽然已有进程级互斥门（第二次会返回 already_running），但这里先拦一道，
+   * 免得用户看到一条本可避免的「正在进行」提示。与同文件 `save()` 的 `saving` 同理。
+   */
+  const checkinBusyRef = useRef(false);
+
   async function checkinAllNow() {
+    if (checkinBusyRef.current) return;
+    checkinBusyRef.current = true;
     setBusy(true);
     setMsg(null);
     try {
@@ -199,6 +238,7 @@ function AutoCheckinCard() {
     } catch (e) {
       setMsg({ type: "err", text: api.asError(e) });
     } finally {
+      checkinBusyRef.current = false;
       setBusy(false);
     }
   }
@@ -229,22 +269,6 @@ function AutoCheckinCard() {
               />
             </SettingsFieldRow>
 
-            <SettingsFieldRow
-              label="保活阈值"
-              description="天；0 表示每天无条件刷新"
-              htmlFor="ac-keep"
-              operational
-            >
-              <Input
-                id="ac-keep"
-                className="w-full sm:w-48"
-                type="number"
-                min={0}
-                max={90}
-                value={cfg.keepalive_days}
-                onChange={(e) => setNum("keepalive_days", e.target.value)}
-              />
-            </SettingsFieldRow>
             <SettingsFieldRow label="惰性刷新" description="小时" htmlFor="ac-lazy" operational>
               <Input
                 id="ac-lazy"
@@ -280,23 +304,44 @@ function AutoCheckinCard() {
         )}
 
         <div className="px-4 py-3 sm:px-5">
-          <p className="mb-2 text-[13px] font-medium">签到日志（最近 30 天）</p>
+          <p className="mb-2 text-[13px] font-medium">签到日志（最近 30 天 · 最新在前）</p>
           {logs.length === 0 ? (
             <p className="py-3 text-center text-sm text-muted-foreground">暂无签到记录</p>
           ) : (
             <div className="max-h-64 overflow-y-auto pr-1">
-              {[...logs].reverse().map((l, i) => {
+              {/* 后端返回的就是"新的在前"，这里不能再 reverse —— 之前反了，配合
+                  max-h-64 的滚动容器，打开永远看到的是最旧的三条。 */}
+              {logs.map((l, i) => {
                 const tone = logLabel(l.result);
+                const gain = logGain(l);
                 return (
                   <div
                     key={i}
-                    className="flex items-center justify-between border-b border-border/60 py-2 text-xs last:border-b-0"
+                    className="flex items-start justify-between gap-2 border-b border-border/60 py-2 text-xs last:border-b-0"
                   >
-                    <div className="min-w-0 flex-1 truncate">
-                      <span className="font-medium">{l.email}</span>
-                      {l.error && <span className="text-destructive">（{l.error}）</span>}
+                    <div className="min-w-0 flex-1">
+                      <div className="flex min-w-0 items-center gap-1.5">
+                        <span className="truncate font-medium" title={l.accountId ?? undefined}>
+                          {logAccountName(l)}
+                        </span>
+                        {l.accountGone && (
+                          <span className="shrink-0 rounded bg-muted px-1 text-[10px] text-muted-foreground">
+                            已不在库中
+                          </span>
+                        )}
+                      </div>
+                      {l.error && (
+                        <p className="truncate text-destructive" title={l.error}>
+                          {l.error}
+                        </p>
+                      )}
+                      {gain && (
+                        <p className={gain.tone === "gain" ? "text-emerald-600" : "text-muted-foreground"}>
+                          {gain.text}
+                        </p>
+                      )}
                     </div>
-                    <div className="ml-2 flex shrink-0 items-center gap-2">
+                    <div className="flex shrink-0 flex-col items-end gap-0.5">
                       <span
                         className={
                           tone.tone === "error"

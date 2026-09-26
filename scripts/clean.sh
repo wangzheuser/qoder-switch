@@ -49,18 +49,27 @@ case "$(uname -s)" in
   *)                    HOST=linux ;;
 esac
 
-cd "$(dirname "$0")/.."
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR/.."
 ROOT="$PWD"
+. "$SCRIPT_DIR/qs-lock.sh"
 
 # 必须是仓库根：防呆，避免在别处误删同名目录。
 for f in Cargo.toml package.json scripts/build.sh; do
   [ -f "$f" ] || { echo "当前目录不像 qoder-switch 仓库根（缺 ${f}）: ${ROOT}" >&2; exit 1; }
 done
 
-# cargo target 目录的推导必须与 build.sh 完全同源，否则清了半天没清到真正的构建目录。
+# cargo target 目录的推导必须与 build.sh 完全同源 —— 连"没导出环境变量时的缺省值"也算，
+# 否则清了半天没清到真正的构建目录；而下面按 TARGET_DIR 定位的构建锁也会跟着查错路径，
+# "边构建边清理"那道保护整个失效。多清一个不存在的路径是无害的，少清才是问题。
+#
+# 缺省值在三端都是仓库内的 target/（cargo 自己的缺省，也是 CI runner 拿到的那个）。
+# 曾有一段时间 Windows 侧钉在 E:/qs-target（C: 盘装不下）；现在两端的构建与清理都收
+# 到这一条规则上，那个旧落点不再被扫描 —— 老机器上若还留着它，手动删一次即可。
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
+# MSYS 下 Windows 形式的路径（用户显式导出的 CARGO_TARGET_DIR 常见）要转成 POSIX 路径
+# 才能 du/rm；本来就是 POSIX 形式的传过去不变，非 Windows 宿主没有 cygpath 就跳过。
 if [ "$HOST" = windows ] && command -v cygpath >/dev/null 2>&1; then
-  # Windows 上 build.sh 会把 target 钉在 E:（形如 E:/qs-target），MSYS 下要转成 POSIX 路径。
   TARGET_DIR="$(cygpath -u "$TARGET_DIR")"
 fi
 case "$TARGET_DIR" in
@@ -101,7 +110,7 @@ record_glob() { # $1 = 说明，$2 = 含通配符的模式
 # ── cargo / tauri 构建目录 ────────────────────────────────────────────────────
 record "cargo/tauri 构建目录（含 release bundle、增量与依赖缓存）" "$TARGET_DIR"
 if [ "$TARGET_DIR" != "$ROOT/target" ]; then
-  record "cargo 构建目录（仓库内默认位置，环境变量指向了别处）" "$ROOT/target"
+  record "cargo 构建目录（仓库内默认位置，本次落点指向了别处）" "$ROOT/target"
 fi
 record "tauri 旧布局构建目录" "$ROOT/src-tauri/target"
 
@@ -176,18 +185,19 @@ fi
 # 实际是清理与构建交叠。本仓库真实踩过一次：磁盘满 → 删 target 腾空间 →
 # 删除还没落地就跑了 build.sh。
 #
-# 判据用 build.sh 留下的锁，而不是扫进程名：进程名分不清是哪个仓库，而且 cargo 的
+# 判据用构建侧留下的锁，而不是扫进程名：进程名分不清是哪个仓库，而且 cargo 的
 # 命令行里并不含仓库路径（cwd 不在 argv 里），按路径扫必然漏检 —— 那正是最该拦住的
 # 情形。PID 已不存在则视为上次异常退出留下的陈旧锁，放行。
+#
+# 判活走 qs_lock_holder 而不是直接 kill -0：Windows 上锁可能由 build.ps1 持有，它的 PID
+# 是 Windows 内核编号，Git-Bash 的 kill 认不出来（本机实测恒判为"不存在"），于是清理把
+# 正在构建的 target 删掉。规则与加锁侧必须同源，所以两边都调同一个函数。
 BUILD_LOCK="$TARGET_DIR/.qs-build-lock"
-if [ -e "$BUILD_LOCK" ]; then
-  holder="$(cat "$BUILD_LOCK/pid" 2>/dev/null || true)"
-  if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
-    echo "检测到构建正在进行（PID ${holder}），拒绝清理。" >&2
-    echo "边构建边清理会把 target/debug/deps 抽走，让 cargo 报出迷惑性的 ENOENT。" >&2
-    echo "等它结束再重跑本脚本。锁文件：${BUILD_LOCK}" >&2
-    exit 1
-  fi
+if [ -e "$BUILD_LOCK" ] && holder="$(qs_lock_holder "$BUILD_LOCK")"; then
+  echo "检测到构建正在进行（PID ${holder}），拒绝清理。" >&2
+  echo "边构建边清理会把 target/debug/deps 抽走，让 cargo 报出迷惑性的 ENOENT。" >&2
+  echo "等它结束再重跑本脚本。锁文件：${BUILD_LOCK}" >&2
+  exit 1
 fi
 
 # 硬保护：绝不动仓库根、家目录、文件系统根，以及仓库根的任一祖先目录。

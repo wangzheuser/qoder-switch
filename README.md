@@ -52,9 +52,9 @@ information stored in 'Qoder CN App Safe Storage'"）。请选**「始终允许�
 
 ## 构建
 
-Windows 侧把工具链与产物钉在 E:（C: 盘余量不足，一次 release target 实测吃掉约 7GB），
-macOS/Linux 侧用默认工具链位置、产物落 `./target`。这些分叉都在 `scripts/build.sh` 里
-按 `uname -s` 判定，不需要记环境变量：
+Windows 侧把工具链缺省钉在 E:（那台开发机的 rustup 装在那儿），产物目录三端一致，都是仓库
+根下的 `target/`。工具链那部分分叉在 `scripts/build.sh` 里按 `uname -s` 判定，不需要记
+环境变量：
 
 ```bash
 bash scripts/build.sh deps      # npm install
@@ -63,6 +63,40 @@ bash scripts/build.sh test      # cargo test --workspace
 bash scripts/build.sh release   # npx tauri build，bundle 目标按宿主自动选
 bash scripts/build.sh all       # deps → icons → test → release
 ```
+
+同一套子命令另有 PowerShell 入口，**只走 Windows**，不需要 Git-Bash/MSYS（CI 的 windows
+runner 与只装了 PowerShell 的机器用这条）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/build.ps1 deps
+powershell -ExecutionPolicy Bypass -File scripts/build.ps1 release
+powershell -ExecutionPolicy Bypass -File scripts/build.ps1 all
+```
+
+**在 cmd.exe 里**用 `scripts\build.bat`（cmd 不能直接执行 `.ps1`：`.\build.ps1` 会报
+`'.' is not recognized as an internal or external command`，裸敲 `build.ps1` 又取决于机器的
+文件关联与执行策略）：
+
+```bat
+scripts\build.bat deps        :: 在 scripts 目录里就写 build.bat
+scripts\build.bat release
+scripts\build.bat all
+```
+
+`build.bat` 只是启动器，逻辑仍在 `build.ps1` 里，参数与退出码原样透传。cmd 里要写 `build.bat`
+或 `.\build.bat` —— `./build.bat` 一样不认，正斜杠被 cmd 当成开关。
+它**必须保持纯 ASCII**：cmd 按 OEM 代码页（本机 936）读批处理，UTF-8 中文会被当 GBK 双字节
+配对并吞掉紧随的 ASCII 字节，连 `rem` 注释行都会碎成命令执行（实测报
+`'的' is not recognized`）。这与 `.ps1` 反过来必须带 UTF-8 BOM 是两回事，别照搬。
+
+两套入口是**同义不同源**的：子命令、退出码（0 成功 / 1 失败 / 2 用法错）、磁盘阈值、构建锁
+与清理落点表都对齐，但各按自己语言的习惯实现（`.ps1` 必须存成 UTF-8 带 BOM，否则 PowerShell
+5.1 解码中文常量成乱码；原生命令的退出码只能逐条查 `$LASTEXITCODE`）。共用逻辑不抄两遍：
+版本一致性核对走 `scripts/check-versions.cjs`（`.sh`/`.ps1` 两条打包入口同调一份；扩展名必须
+是 `.cjs`，本仓库 `package.json` 有 `"type": "module"`），构建锁的判活规则走
+`scripts/qs-lock.sh`。锁目录里除 `pid` 还写 `winpid`（Windows 内核 PID）—— Git-Bash 的
+`kill -0` 认不出内核 PID，只按 `pid` 判活的话 `clean.sh` 会看不见 `build.ps1` 正持有的锁
+并把 target 删掉，两个方向现在都锁得住。
 
 `release` 的 bundle 目标集中在 `build.sh` 的 `BUNDLES` 一处：Windows `nsis`，
 macOS `app,dmg`。Tauri 会按宿主自动合并 `src-tauri/tauri.macos.conf.json`
@@ -84,8 +118,17 @@ bash scripts/clean.sh --yes      # 免确认（非交互环境必须显式带，
 bash scripts/clean.sh --all      # 连 node_modules 一起清（之后需 npm install）
 ```
 
-`src-tauri/icons/`、`Cargo.lock`、`package-lock.json` 等已入库文件不会被清理；
-`CARGO_TARGET_DIR` 指向仓库外（Windows 的 `E:/qs-target`）时清单里会标 `⚠ 位于仓库外`。
+Windows 上用 PowerShell 跑同一张表（旗标与退出码一致，`-n/-y/-a` 短名同样可用）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/clean.ps1 --dry-run
+powershell -ExecutionPolicy Bypass -File scripts/clean.ps1 --yes
+```
+
+`src-tauri/icons/`、`Cargo.lock`、`package-lock.json` 等已入库文件不会被清理；target 落点与
+构建侧同源推导（三端缺省都是仓库内的 `target/`，两侧规则逐字符相同，不存在"构建写到 A、
+清理去删 B"），落在仓库外时（你显式导出了 `CARGO_TARGET_DIR`）清单里会标 `⚠ 位于仓库外`。
+有构建正在跑时两个脚本都拒绝删除（见上面的构建锁）。
 
 ### 工具链位置与产物
 
@@ -94,7 +137,12 @@ Windows 上 `RUSTUP_HOME` / `CARGO_HOME` 若不在默认位置，脚本会读环
 源替换，否则拉索引会超时。GitHub Actions 的 runner 没有 E: 盘，所以这些钉法只写在
 `build.sh` 里、且只在 Windows 分支生效，不进 `.cargo/config.toml`。
 
-产物目录（`$CARGO_TARGET_DIR`，Windows 上是 `E:/qs-target`，macOS/Linux 上是 `./target`）：
+产物目录三端同一条规则：`$CARGO_TARGET_DIR`，没导出时取 **仓库根下的 `target/`** ——
+就是 cargo 自己的缺省，也是 CI runner 拿到的那个。曾经 Windows 分支把它钉在
+`E:/qs-target`（那台开发机的 C: 盘装不下约 7 GB 的 release target），但"仓库在哪块盘"
+不该由脚本来替用户决定，且一个平台一个落点会让 clean 与构建在两宿主间对不上号。
+系统盘吃紧就自己 `export CARGO_TARGET_DIR=<别处>`，四个脚本（`build.*` / `clean.*` /
+`pack-npm.*`）都跟随它。产物位置（相对 `$CARGO_TARGET_DIR`）：
 
 | | Windows | macOS |
 | --- | --- | --- |
@@ -240,8 +288,10 @@ macOS 侧 2026-09-23 实跑结果（装了 `Qoder CN.app` 0.3.4 并已登录的�
   （端点来自 10router 取证并实测 200），账号卡显示总容量/剩余/临期资源包
 - 每日签到与 Credits 领取：`POST /sash/api/v1/me/campaigns/{id}/claim`；单账号签到、
   批量签到、官方未开放签到（无 CLAIM_BENEFIT 活动）判为 `inactive` 而不是谎报"已签到"
-- 自动签到本机调度：配置持久化在 `checkin-config.json`，两个宿主共用同一条调度线程
-  （启动即核验一次、之后按惰性刷新间隔复查），签到结果落在 `checkin-logs.json`
+- 自动签到本机调度：配置持久化在 `checkin-config.json`，两个宿主共用同一份调度实现
+  （各自进程内起一条线程；启动即核验一次、之后按惰性刷新间隔复查，今天已签的账号跳过
+  网络查询），签到结果落在 `checkin-logs.json`（每行带账号展示名、本次领到的 Credits 与
+  签到前后余额）；手动与自动共用一道进程级互斥门
 - 积分统计：Qoder 无官方用量端点，统计页用本机配额快照（`credit-snapshots.jsonl`，
   按账号 10 分钟节流）聚合日消耗/账号明细/签到事件 —— 真实观察值，不编造
 - OAuth 设备码登录：浏览器授权 + S256 PKCE + `deviceToken/poll`，授权成功即自动采集入库

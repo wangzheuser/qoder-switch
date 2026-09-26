@@ -4,7 +4,7 @@
 //!
 //! 不打印任何凭据：这里只落账号 id / 邮箱 / 数值与结果枚举。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -39,8 +39,12 @@ fn snapshots_path(store: &Path) -> PathBuf {
 }
 
 /// 前端 `CheckinConfig` 契约（snake_case 沿用上游）。缺省关闭 —— 自动打网络请求
-/// 的开关必须默认关闭。阈值给的是可用缺省（7 天保活 / 6 小时惰性核验），
-/// 不是 0：0 会让设置页刚打开就显示"每天无条件刷新"这种从来没发生过的语义。
+/// 的开关必须默认关闭。惰性刷新给 6 小时这个可用缺省，不是 0：0 会让设置页刚打开
+/// 就显示"每小时无条件刷新"这种从来没发生过的语义。
+///
+/// 上游还带过 `keepalive_days`（保活天数）与 `start_hour`/`end_hour`，本项目的调度
+/// 从未读取过它们。签到是每日一次的幂等领取，「今天签没签」由本机日志即可判定，
+/// 不需要第二个时间维度 —— 因此只持久化真正生效的字段，不再留下永不生效的开关。
 pub fn read_checkin_config(store: &Path) -> Value {
     let raw: Value = std::fs::read(checkin_config_path(store))
         .ok()
@@ -48,7 +52,6 @@ pub fn read_checkin_config(store: &Path) -> Value {
         .unwrap_or_else(|| json!({}));
     json!({
         "enabled": raw.get("enabled").and_then(|x| x.as_bool()).unwrap_or(false),
-        "keepalive_days": raw.get("keepalive_days").and_then(|x| x.as_u64()).unwrap_or(7),
         "lazy_refresh_hours": raw.get("lazy_refresh_hours").and_then(|x| x.as_u64()).unwrap_or(6),
     })
 }
@@ -59,9 +62,6 @@ pub fn write_checkin_config(store: &Path, patch: &Value) -> crate::Result<Value>
     let mut cur = read_checkin_config(store);
     if let Some(b) = patch.get("enabled").and_then(|x| x.as_bool()) {
         cur["enabled"] = json!(b);
-    }
-    if let Some(n) = patch.get("keepalive_days").and_then(|x| x.as_u64()) {
-        cur["keepalive_days"] = json!(n.clamp(0, 90));
     }
     if let Some(n) = patch.get("lazy_refresh_hours").and_then(|x| x.as_u64()) {
         cur["lazy_refresh_hours"] = json!(n.clamp(1, 72));
@@ -74,18 +74,40 @@ pub fn write_checkin_config(store: &Path, patch: &Value) -> crate::Result<Value>
 
 /// 一条签到日志。`result` 只会是 success / already / error；inactive（官方未开放）
 /// 什么都没发生，不记 —— 否则自动签到的每次轮询都会刷出一条噪声。
+///
+/// 键名走 camelCase 与前端 `CheckinLog` 契约对齐。此前这个结构没有 `rename_all`，
+/// 落盘是 `account_id` 而 `src/lib/types.ts` 声明的是 `accountId`：前端读回来恒为
+/// undefined，于是 email 为空时连"回落到账号 id"的余地都没有（实测本机三条日志 email
+/// 全为 `""`，签到日志整行左侧空白）。`alias` 让已落盘的老 `account_id` 仍能读回，
+/// 不需要迁移。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CheckinLogEntry {
     pub ts: i64,
-    #[serde(default)]
+    #[serde(default, alias = "account_id")]
     pub account_id: Option<String>,
     #[serde(default)]
     pub email: String,
+    /// 展示用的账号名，见 [`account_label`]。历史日志里没有这个键，读回来是空串，
+    /// 前端与统计事件都按 `accountName → email → accountId` 回落。
+    #[serde(default)]
+    pub account_name: String,
     pub result: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default)]
     pub variant: String,
+    /// 本次领到的 Credits（claim 响应里 `benefit.amount` 的汇总）。
+    /// `already` / `error` 没有这个数，用 `None` 而不是 0 —— 0 会被读成"领到了 0 分"。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed: Option<f64>,
+    /// 签到前的余额：该账号最近一条配额快照的 `total_remaining`。快照有 10 分钟节流，
+    /// 所以这是"上一次记录到的余额"，不是严格意义上的领取瞬间前值。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_before: Option<f64>,
+    /// 签到后的余额：领完再查一次配额。查失败时为 `None`，不拿旧值冒充。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_after: Option<f64>,
 }
 
 fn read_logs_raw(store: &Path) -> Vec<CheckinLogEntry> {
@@ -101,15 +123,95 @@ fn write_logs_raw(store: &Path, logs: &[CheckinLogEntry]) -> std::io::Result<()>
     atomic_write_bytes(&checkin_logs_path(store), &text)
 }
 
+/// 「这条记录是哪个账号」的唯一答案。
+///
+/// 传进来的 `email` 经常是空的：国内版桌面登录态里 `user.email` 本身就可能没值，
+/// 而 `quota::resolve_identity_full` 只回一个 email。账号卡的口径是
+/// `nickname || email || uid || id`，统计事件也是同一套，所以这里按
+/// `email → 包里的 email → name → uid → account_id` 兜底，别再在第三个地方抄一遍。
+pub fn account_label(store: &Path, account_id: &str, email: &str, variant: QoderVariant) -> String {
+    let e = email.trim();
+    if !e.is_empty() {
+        return e.to_string();
+    }
+    if let Ok(b) = bundle::load(store, account_id, variant, QoderTarget::Desktop) {
+        for cand in [
+            b.identity.email.as_deref(),
+            b.identity.name.as_deref(),
+            b.identity.uid.as_deref(),
+        ] {
+            if let Some(c) = cand.map(str::trim).filter(|s| !s.is_empty()) {
+                return c.to_string();
+            }
+        }
+    }
+    account_id.to_string()
+}
+
+/// 写一条日志时要带的结果数据。
+///
+/// 用结构体而不是继续往后缀函数上叠位置参数：六个调用点里有五个只关心 result/error，
+/// 摊平成 9 个位置参数之后传错顺序是迟早的事，而 `claimed`/余额都是 `Option<f64>`，
+/// 编译器一个都抓不出来。
+#[derive(Debug, Clone, Default)]
+pub struct CheckinOutcome<'a> {
+    pub result: &'a str,
+    pub error: Option<&'a str>,
+    pub claimed: Option<f64>,
+    pub remaining_before: Option<f64>,
+    pub remaining_after: Option<f64>,
+}
+
+impl<'a> CheckinOutcome<'a> {
+    pub fn error(msg: &'a str) -> Self {
+        Self { result: "error", error: Some(msg), ..Default::default() }
+    }
+
+    /// 今日已签（服务端正面回了 CLAIMED）：什么都没领到，所以没有收益数据。
+    pub fn already() -> Self {
+        Self { result: "already", ..Default::default() }
+    }
+
+    pub fn success(claimed: f64, remaining_before: Option<f64>, remaining_after: Option<f64>) -> Self {
+        Self {
+            result: "success",
+            claimed: Some(claimed),
+            remaining_before,
+            remaining_after,
+            ..Default::default()
+        }
+    }
+}
+
+/// 该账号最近一条配额快照的余额；没有快照则 `None`。
+///
+/// 只读本地 jsonl，不打网络 —— 签到前的余额用它拿，避免为了显示"从多少开始"
+/// 而给每个账号多加一次请求。
+pub fn latest_credit_remaining(store: &Path, account_id: &str) -> Option<f64> {
+    read_snapshots_raw(&snapshots_path(store))
+        .into_iter()
+        .rev()
+        .find(|s| s.account_id == account_id)
+        .map(|s| s.total_remaining)
+}
+
+/// 非有限的浮点（NaN / inf）不是数据：它会让整条日志的 JSON 序列化失败，
+/// 于是那一行**静默消失**。折成 `None`（= 数值未知），前端本来就按未知不显示。
+fn finite(v: Option<f64>) -> Option<f64> {
+    v.filter(|x| x.is_finite())
+}
+
 /// 记录一条签到结果（新的在前；30 天外与超量裁剪）。
 pub fn record_checkin_log(
     store: &Path,
     account_id: &str,
     email: &str,
     variant: QoderVariant,
-    result: &str,
-    error: Option<&str>,
+    outcome: CheckinOutcome<'_>,
 ) {
+    // 先算标签再进锁：account_label 要读 bundle.json，而 LEDGER_GATE 是日志与快照
+    // 共用的写门，没必要把一次文件读圈在锁里。
+    let name = account_label(store, account_id, email, variant);
     let _gate = LEDGER_GATE.lock().unwrap_or_else(|p| p.into_inner());
     let mut logs = read_logs_raw(store);
     logs.insert(
@@ -118,9 +220,13 @@ pub fn record_checkin_log(
             ts: chrono::Utc::now().timestamp_millis(),
             account_id: Some(account_id.to_string()),
             email: email.to_string(),
-            result: result.to_string(),
-            error: error.map(String::from),
+            account_name: name,
+            result: outcome.result.to_string(),
+            error: outcome.error.map(String::from),
             variant: super::view::variant_key(variant).to_string(),
+            claimed: finite(outcome.claimed),
+            remaining_before: finite(outcome.remaining_before),
+            remaining_after: finite(outcome.remaining_after),
         },
     );
     let cutoff = chrono::Utc::now().timestamp_millis() - RETENTION_DAYS * 86_400_000;
@@ -129,9 +235,56 @@ pub fn record_checkin_log(
     let _ = write_logs_raw(store, &logs);
 }
 
+/// 日志里的账号现在还在不在库里。
+///
+/// `local-*` 是"桌面现场账号"的合成 id，本来就没有账号包，不能按"包不存在"判成已删除
+/// —— 那会给最常见的一类日志行打上假灰标。
+fn account_present(store: &Path, account_id: &str, variant_key: &str) -> bool {
+    let variant = super::view::variant_from_key(Some(variant_key));
+    if account_id.starts_with("local-") || account_id == super::view::local_account_id(variant) {
+        return true;
+    }
+    bundle::load(store, account_id, variant, QoderTarget::Desktop).is_ok()
+}
+
+/// 一条日志对外展示的名字。历史日志没有 `accountName`，按同一口径回落。
+fn log_display_name(l: &CheckinLogEntry) -> String {
+    if !l.account_name.is_empty() {
+        return l.account_name.clone();
+    }
+    if !l.email.is_empty() {
+        return l.email.clone();
+    }
+    l.account_id.clone().unwrap_or_else(|| "未知账号".into())
+}
+
 /// 前端 `get_checkin_logs` 契约：`{ logs: [...] }`。
+///
+/// 每条再补一个 `accountGone`：账号包在日志写下之后被删掉（"幽灵卡片"那类），
+/// 光看日志会找不到对应账号，所以这一位由读取侧现算。按 distinct 账号 id 缓存，
+/// 一次读取只 load 几回。
 pub fn read_checkin_logs(store: &Path) -> Value {
-    json!({ "logs": read_logs_raw(store) })
+    let mut present: BTreeMap<String, bool> = BTreeMap::new();
+    let logs: Vec<Value> = read_logs_raw(store)
+        .iter()
+        .map(|l| {
+            // 序列化失败也要出一行，而不是让这条日志凭空消失：这一份数据只有本机有，
+            // 悄悄丢掉就等于没发生过。
+            let mut v = serde_json::to_value(l).unwrap_or_else(|e| {
+                json!({ "ts": l.ts, "accountId": l.account_id, "result": l.result,
+                        "error": format!("日志序列化失败: {e}") })
+            });
+            let gone = match l.account_id.as_deref() {
+                Some(id) => !*present
+                    .entry(id.to_string())
+                    .or_insert_with(|| account_present(store, id, &l.variant)),
+                None => false,
+            };
+            v["accountGone"] = json!(gone);
+            v
+        })
+        .collect();
+    json!({ "logs": logs })
 }
 
 /// 一条配额快照（jsonl 行）。
@@ -444,7 +597,7 @@ pub fn credit_statistics(roots: &PathRoots, store: &Path, refresh: bool) -> Valu
             "ts": l.ts,
             "date": date_key_ms(l.ts),
             "accountId": l.account_id,
-            "accountName": if l.email.is_empty() { l.account_id.clone().unwrap_or_else(|| "未知账号".into()) } else { l.email.clone() },
+            "accountName": log_display_name(l),
             "result": l.result,
             "error": l.error,
             "variant": l.variant,
@@ -474,6 +627,28 @@ pub fn credit_statistics(roots: &PathRoots, store: &Path, refresh: bool) -> Valu
     out
 }
 
+/// 今天该账号是否已有某类结果的日志。自动流程用它做两件事：
+/// 失败按天去重（否则每小时一轮会把一个坏账号刷成日志墙），以及「当天已签短路」。
+pub fn has_today_log(store: &Path, account_id: &str, result: &str) -> bool {
+    let today = today_key();
+    read_logs_raw(store).iter().any(|l| {
+        l.account_id.as_deref() == Some(account_id) && l.result == result && date_key_ms(l.ts) == today
+    })
+}
+
+/// 今天已成功签到的账号集合（`success` 与 `already` 都算已签）。
+/// 自动签到据此短路：本地日志已有今天的结论，就不必再问一次服务端。
+fn checked_in_today(store: &Path) -> HashSet<String> {
+    let today = today_key();
+    read_logs_raw(store)
+        .into_iter()
+        .filter(|l| {
+            date_key_ms(l.ts) == today && (l.result == "success" || l.result == "already")
+        })
+        .filter_map(|l| l.account_id)
+        .collect()
+}
+
 /// 自动签到的一次核验：启动时与每 `lazy_refresh_hours` 间隔调用。
 /// 只做幂等的"未签则签"，绝不碰切换（换号是另一条红线，由用户亲手决定）。
 pub fn run_auto_checkin_once(roots: &PathRoots, store: &Path) -> Value {
@@ -481,6 +656,13 @@ pub fn run_auto_checkin_once(roots: &PathRoots, store: &Path) -> Value {
     if !cfg["enabled"].as_bool().unwrap_or(false) {
         return json!({ "status": "disabled" });
     }
+    // 与手动批量签到共用同一道门：抢不到说明手动那一轮正在跑，让出即可。
+    let Some(_gate) = quota::try_acquire_checkin() else {
+        return json!({ "status": "skipped", "reason": "already_running" });
+    };
+    // 一轮开始时读一次今天的日志：已签的账号直接跳过网络查询。
+    // 签到是每日一次的活动，这条短路能把「每轮 N 次查询」压到「每轮只查未签的」。
+    let done_today = checked_in_today(store);
     let mut checked = 0u32;
     let (mut success, mut already, mut inactive, mut error) = (0u32, 0u32, 0u32, 0u32);
     for b in bundle::list_all(store) {
@@ -488,8 +670,24 @@ pub fn run_auto_checkin_once(roots: &PathRoots, store: &Path) -> Value {
         if b.target != QoderTarget::Desktop || b.variant != QoderVariant::Cn {
             continue;
         }
+        // 本地已有今天的成功结论 → 短路，省一次 campaigns 查询。
+        if done_today.contains(&b.account_id) {
+            already += 1;
+            continue;
+        }
         let st = quota::get_checkin_status_sync(roots, store, &b.account_id, b.variant);
         if st.get("ok").and_then(|x| x.as_bool()) != Some(true) {
+            // 失败必须可见：此前只累加计数，而返回值又被调用方 `let _ =` 丢弃，
+            // 凭据解不开 / 网络错误这些情况在界面上一个字都看不到。
+            // 按天去重 —— 同一账号今天已记过 error 就不再写，否则每小时一轮会刷成日志墙。
+            let msg = st
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("查询签到状态失败");
+            if !has_today_log(store, &b.account_id, "error") {
+                let email = b.identity.email.clone().unwrap_or_default();
+                record_checkin_log(store, &b.account_id, &email, b.variant, CheckinOutcome::error(msg));
+            }
             error += 1;
             continue;
         }
@@ -572,37 +770,137 @@ mod tests {
         let merged = write_checkin_config(&dir, &json!({ "enabled": true, "lazy_refresh_hours": 0 })).unwrap();
         assert_eq!(merged["enabled"], true);
         assert_eq!(merged["lazy_refresh_hours"], 1, "低于下限收口到 1");
-        let merged = write_checkin_config(&dir, &json!({ "keepalive_days": 999 })).unwrap();
-        assert_eq!(merged["keepalive_days"], 90);
         // 只写 patch 不能把没提到的字段冲掉。
-        assert_eq!(merged["enabled"], true);
+        let merged = write_checkin_config(&dir, &json!({ "lazy_refresh_hours": 12 })).unwrap();
+        assert_eq!(merged["enabled"], true, "未提及的 enabled 必须保留");
+        assert_eq!(merged["lazy_refresh_hours"], 12);
+        // 上游遗留字段不再持久化：写了也不落盘，界面上不会出现永不生效的开关。
+        let merged = write_checkin_config(&dir, &json!({ "keepalive_days": 999 })).unwrap();
+        assert!(merged.get("keepalive_days").is_none(), "{merged}");
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// 测试用的日志条目：新字段一多，逐条写字面量会把 fixture 的意图埋掉。
+    fn entry(ts: i64, id: &str, result: &str) -> CheckinLogEntry {
+        CheckinLogEntry {
+            ts,
+            account_id: Some(id.into()),
+            email: format!("{id}@x.com"),
+            account_name: String::new(),
+            result: result.into(),
+            error: None,
+            variant: "cn".into(),
+            claimed: None,
+            remaining_before: None,
+            remaining_after: None,
+        }
     }
 
     #[test]
     fn checkin_logs_are_recorded_pruned_and_read_back() {
         let dir = temp_store();
-        record_checkin_log(&dir, "acct-a", "a@x.com", QoderVariant::Cn, "success", None);
-        record_checkin_log(&dir, "acct-b", "b@x.com", QoderVariant::Global, "error", Some("HTTP 500"));
+        record_checkin_log(
+            &dir,
+            "acct-a",
+            "a@x.com",
+            QoderVariant::Cn,
+            CheckinOutcome::success(120.0, Some(300.0), Some(420.0)),
+        );
+        record_checkin_log(&dir, "acct-b", "b@x.com", QoderVariant::Global, CheckinOutcome::error("HTTP 500"));
         let logs = read_checkin_logs(&dir)["logs"].as_array().cloned().unwrap();
         assert_eq!(logs.len(), 2);
         assert_eq!(logs[0]["result"], "error", "新的在前");
         assert_eq!(logs[0]["variant"], "ai");
         assert_eq!(logs[1]["email"], "a@x.com");
+        // 键名必须是 camelCase：前端 CheckinLog 按 accountId / accountName 读，
+        // 而这个结构此前没有 rename_all，落盘是 account_id —— 前端读回来恒为 undefined。
+        assert_eq!(logs[1]["accountId"], "acct-a");
+        assert_eq!(logs[1]["accountName"], "a@x.com", "有 email 时展示名就是 email");
+        assert_eq!(logs[1]["claimed"], 120.0);
+        assert_eq!(logs[1]["remainingBefore"], 300.0);
+        assert_eq!(logs[1]["remainingAfter"], 420.0);
+        assert_eq!(logs[0]["claimed"], Value::Null, "失败行不带收益数据，也不能是 0");
         // 40 天前的条目在下一次写入时被裁掉。
         std::fs::write(
             checkin_logs_path(&dir),
             serde_json::to_vec(&[
-                CheckinLogEntry { ts: chrono::Utc::now().timestamp_millis() - 40 * 86_400_000, account_id: Some("acct-old".into()), email: "old@x.com".into(), result: "success".into(), error: None, variant: "cn".into() },
-                CheckinLogEntry { ts: chrono::Utc::now().timestamp_millis(), account_id: Some("acct-new".into()), email: "n@x.com".into(), result: "success".into(), error: None, variant: "cn".into() },
+                entry(chrono::Utc::now().timestamp_millis() - 40 * 86_400_000, "acct-old", "success"),
+                entry(chrono::Utc::now().timestamp_millis(), "acct-new", "success"),
             ])
             .unwrap(),
         )
         .unwrap();
-        record_checkin_log(&dir, "acct-c", "c@x.com", QoderVariant::Cn, "already", None);
+        record_checkin_log(&dir, "acct-c", "c@x.com", QoderVariant::Cn, CheckinOutcome::already());
         let logs = read_checkin_logs(&dir)["logs"].as_array().cloned().unwrap();
         assert_eq!(logs.len(), 2, "40 天前的条目必须被裁掉: {logs:?}");
-        assert!(logs.iter().all(|l| l["accountId"] != "acct-old"));
+        assert!(logs.iter().all(|l| l["accountId"] != "acct-old"), "{logs:?}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn legacy_snake_case_entries_still_read_and_fall_back_to_account_id() {
+        let dir = temp_store();
+        // 已落盘的老日志：snake_case 的 account_id，没有 accountName / claimed / 余额字段。
+        // 修键名时不能把它们读成"账号未知"，所以 alias 是契约的一部分。
+        std::fs::write(
+            checkin_logs_path(&dir),
+            br#"[{"ts":1790411151842,"account_id":"oauth-01a0bdb8","email":"","result":"success","variant":"cn"}]"#,
+        )
+        .unwrap();
+        let logs = read_checkin_logs(&dir)["logs"].as_array().cloned().unwrap();
+        assert_eq!(logs.len(), 1, "旧的 account_id 键必须还能读回来");
+        assert_eq!(logs[0]["accountId"], "oauth-01a0bdb8");
+        assert_eq!(logs[0]["accountName"], "", "老数据没有展示名，读回来是空串");
+
+        // 展示名由 log_display_name 兜底：email 空 → accountId。
+        // 这条正是截图里那行空白（email 恒为空、账号列什么都没有）的修法。
+        let l = &read_logs_raw(&dir)[0];
+        assert_eq!(log_display_name(l), "oauth-01a0bdb8");
+        let stats = credit_statistics(&PathRoots::real(), &dir, false);
+        assert_eq!(stats["events"][0]["accountName"], "oauth-01a0bdb8", "{stats}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn account_label_falls_back_through_bundle_then_id() {
+        let dir = temp_store();
+        // 没有账号包、email 又是空的（国内版桌面登录态常见）→ 只能回落到账号 id，
+        // 但绝不能回落到空串：空串在前端就是一行空白。
+        assert_eq!(account_label(&dir, "acct-x", "", QoderVariant::Cn), "acct-x");
+        assert_eq!(account_label(&dir, "acct-x", "   ", QoderVariant::Cn), "acct-x", "全空白也算没有");
+        assert_eq!(account_label(&dir, "acct-x", "me@x.com", QoderVariant::Cn), "me@x.com");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn read_marks_gone_accounts_but_not_local_ones() {
+        let dir = temp_store();
+        record_checkin_log(&dir, "acct-deleted", "gone@x.com", QoderVariant::Cn, CheckinOutcome::already());
+        record_checkin_log(&dir, "local-cn", "", QoderVariant::Cn, CheckinOutcome::already());
+        let logs = read_checkin_logs(&dir)["logs"].as_array().cloned().unwrap();
+        // local-cn 是"桌面现场账号"的合成 id，本来就没有账号包，不能判成已删除。
+        let by_id = |id: &str| logs.iter().find(|l| l["accountId"] == id).unwrap().clone();
+        assert_eq!(by_id("acct-deleted")["accountGone"], true, "库里没有包 = 幽灵账号");
+        assert_eq!(by_id("local-cn")["accountGone"], false, "现场账号不能被标成已删除");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn non_finite_credits_do_not_eat_the_log_entry() {
+        let dir = temp_store();
+        record_checkin_log(
+            &dir,
+            "acct-nan",
+            "nan@x.com",
+            QoderVariant::Cn,
+            CheckinOutcome::success(f64::NAN, Some(f64::INFINITY), Some(120.0)),
+        );
+        let logs = read_checkin_logs(&dir)["logs"].as_array().cloned().unwrap();
+        assert_eq!(logs.len(), 1, "一条坏数值不能带走整行: {logs:?}");
+        assert_eq!(logs[0]["accountId"], "acct-nan");
+        assert_eq!(logs[0]["claimed"], Value::Null, "非有限值折成未知");
+        assert_eq!(logs[0]["remainingBefore"], Value::Null);
+        assert_eq!(logs[0]["remainingAfter"], 120.0);
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -651,6 +949,59 @@ mod tests {
         // 无配置文件 = disabled：调度循环必须直接返回，一个账号都不碰。
         let r = run_auto_checkin_once(&PathRoots::real(), &dir);
         assert_eq!(r["status"], "disabled", "{r}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn today_log_lookup_is_day_and_result_scoped() {
+        let dir = temp_store();
+        record_checkin_log(&dir, "acct-a", "a@x.com", QoderVariant::Cn, CheckinOutcome::error("HTTP 500"));
+        assert!(has_today_log(&dir, "acct-a", "error"));
+        assert!(!has_today_log(&dir, "acct-a", "success"), "结果类型必须区分");
+        assert!(!has_today_log(&dir, "acct-b", "error"), "账号必须区分");
+
+        // 昨天的 error 不能算今天 —— 否则今天的失败会被永久去重掉，用户再也看不到。
+        std::fs::write(
+            checkin_logs_path(&dir),
+            serde_json::to_vec(&[entry(chrono::Utc::now().timestamp_millis() - 86_400_000, "acct-a", "error")])
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!has_today_log(&dir, "acct-a", "error"), "昨天的日志不算今天");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn checked_in_today_excludes_failures() {
+        let dir = temp_store();
+        assert!(checked_in_today(&dir).is_empty(), "无日志时短路集合为空");
+        record_checkin_log(&dir, "acct-ok", "ok@x.com", QoderVariant::Cn, CheckinOutcome::success(10.0, None, None));
+        record_checkin_log(&dir, "acct-already", "al@x.com", QoderVariant::Cn, CheckinOutcome::already());
+        record_checkin_log(&dir, "acct-err", "err@x.com", QoderVariant::Cn, CheckinOutcome::error("HTTP 500"));
+        let set = checked_in_today(&dir);
+        assert!(set.contains("acct-ok"));
+        assert!(set.contains("acct-already"));
+        // error 绝不能进短路集合：否则查询失败的账号会被当成"已签"永久跳过。
+        assert!(!set.contains("acct-err"), "{set:?}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// 互斥门与「启用但库里无账号」串在同一个测试里：两者都碰全局 `CHECKIN_GATE`，
+    /// 拆成两个 `#[test]` 会在 cargo 的并行测试下互相抢锁而 flaky。
+    #[test]
+    fn checkin_gate_serializes_and_enabled_noop_is_done() {
+        let first = quota::try_acquire_checkin().expect("首次必须抢到");
+        assert!(quota::try_acquire_checkin().is_none(), "持锁期间第二次抢占必须失败");
+        drop(first);
+        assert!(quota::try_acquire_checkin().is_some(), "释放后必须能再抢到");
+
+        // enabled 但没有账号：一轮跑完、计数全 0，证明门能被正常获取与释放。
+        let dir = temp_store();
+        write_checkin_config(&dir, &json!({ "enabled": true })).unwrap();
+        let r = run_auto_checkin_once(&PathRoots::real(), &dir);
+        assert_eq!(r["status"], "done", "{r}");
+        assert_eq!(r["checked"], 0);
+        assert_eq!(r["error"], 0);
         std::fs::remove_dir_all(dir).ok();
     }
 }

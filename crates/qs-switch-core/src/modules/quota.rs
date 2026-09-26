@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::{json, Value};
 
@@ -21,6 +22,36 @@ pub fn openapi_base(variant: QoderVariant) -> &'static str {
         QoderVariant::Cn => "https://openapi.qoder.com.cn",
         QoderVariant::Global => "https://openapi.qoder.sh",
     }
+}
+
+/// 签到任务互斥门：手动批量签到（`checkin_all`）与自动调度（`ledger::run_auto_checkin_once`）
+/// 共用。**非阻塞**抢占 —— 抢不到就直接返回 `already_running`，绝不排队：
+/// 排队会让「全部立即签到」按钮一直转圈，而两轮签到本身没有任何意义。
+///
+/// 用 `AtomicBool` 而不是 `Mutex`：`checkin_all` 是 async 函数（Tauri 命令要求 Future 为
+/// `Send`），而 `MutexGuard` 不是 `Send`，跨 `.await` 持有会让整个 Future 失去 `Send`。
+/// 这里用 CAS 占位 + RAII guard 释放，guard 本身是 `Send`，也顺带没有中毒语义要处理。
+///
+/// 只覆盖单进程内的并发（手动 vs 自动、设置页 vs 账号页）。桌面端与 webui 是两个进程，
+/// 跨进程的重复由 `run_auto_checkin_once` 的「当天已签短路」收敛：先签完的那个写日志，
+/// 另一个下一轮读到日志就跳过，不必为此引入文件锁。
+static CHECKIN_INFLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// 抢占成功后的占位凭证，drop 时释放（panic 展开同样会走到）。
+pub(crate) struct CheckinGuard;
+
+impl Drop for CheckinGuard {
+    fn drop(&mut self) {
+        CHECKIN_INFLIGHT.store(false, Ordering::Release);
+    }
+}
+
+/// 非阻塞抢占签到门。`None` = 已有一轮签到在跑（手动或自动）。
+pub(crate) fn try_acquire_checkin() -> Option<CheckinGuard> {
+    CHECKIN_INFLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .ok()
+        .map(|_| CheckinGuard)
 }
 
 /// 解析指定账号的有效 Bearer Token（优先读取账号包解密结果，次级读取现场文件）。
@@ -489,7 +520,15 @@ pub async fn checkin(
     let (token, email, proxy) = match resolve_identity_full(roots, store, account_id, variant) {
         Ok(t) => t,
         Err(e) => {
-            crate::modules::ledger::record_checkin_log(store, account_id, "", variant, "error", Some(&e));
+            // email 这里拿不到（解析失败正是因为它拿不到），留空即可：
+            // record_checkin_log 会按 account_id 兜底出账号名。
+            crate::modules::ledger::record_checkin_log(
+                store,
+                account_id,
+                "",
+                variant,
+                crate::modules::ledger::CheckinOutcome::error(&e),
+            );
             return json!({ "result": "error", "error": e });
         }
     };
@@ -508,12 +547,12 @@ pub async fn checkin(
         Ok(res) if res.status().is_success() => res.json().await.unwrap_or_default(),
         Ok(res) => {
             let e = format_http_error("获取签到活动", res.status());
-            crate::modules::ledger::record_checkin_log(store, account_id, &email, variant, "error", Some(&e));
+            crate::modules::ledger::record_checkin_log(store, account_id, &email, variant, crate::modules::ledger::CheckinOutcome::error(&e));
             return json!({ "result": "error", "error": e });
         }
         Err(e) => {
             let msg = format!("网络错误: {e}");
-            crate::modules::ledger::record_checkin_log(store, account_id, &email, variant, "error", Some(&msg));
+            crate::modules::ledger::record_checkin_log(store, account_id, &email, variant, crate::modules::ledger::CheckinOutcome::error(&msg));
             return json!({ "result": "error", "error": msg });
         }
     };
@@ -552,7 +591,7 @@ pub async fn checkin(
         // 只有正面看到 CLAIMED 才报"今日已签到"。此前只判"没有可领的"就一律说已签到，
         // 把 EXPIRED/LOCKED/未知枚举也折叠成成功 —— 用户拿到绿色提示但没领到东西。
         if has_claimed {
-            crate::modules::ledger::record_checkin_log(store, account_id, &email, variant, "already", None);
+            crate::modules::ledger::record_checkin_log(store, account_id, &email, variant, crate::modules::ledger::CheckinOutcome::already());
             return json!({ "result": "already", "message": "今日已签到" });
         }
         return json!({
@@ -561,6 +600,10 @@ pub async fn checkin(
             "message": "当前没有可领取的签到奖励（活动状态未知或已结束）"
         });
     }
+
+    // 签到前的余额：读本地最近一条配额快照，零网络成本。放在领取之前 —— 领取成功后
+    // 那次配额查询会把新快照写进来，之后再读就读到"之后"了。
+    let remaining_before = crate::modules::ledger::latest_credit_remaining(store, account_id);
 
     let mut total_claimed = 0f64;
     let mut success_count = 0usize;
@@ -594,11 +637,27 @@ pub async fn checkin(
 
     if success_count == 0 {
         let e = last_err.unwrap_or_else(|| "领取失败".to_string());
-        crate::modules::ledger::record_checkin_log(store, account_id, &email, variant, "error", Some(&e));
+        crate::modules::ledger::record_checkin_log(store, account_id, &email, variant, crate::modules::ledger::CheckinOutcome::error(&e));
         return json!({ "result": "error", "error": e });
     }
 
-    crate::modules::ledger::record_checkin_log(store, account_id, &email, variant, "success", None);
+    // 领完之后复查一次余额，作为"确实到账"的正面证据 —— 这个模块反复踩过的坑是把
+    // 没证据的状态折叠成好消息（见上面 CLAIMED 那段注释），而 claim 返回 200 并不等于
+    // 分已经加到账户上。代价是每账号每天一次额外请求，只走成功分支。
+    // 顺带：这次查询会落一条 CreditSnapshot，统计页的趋势线也因此更密。
+    let credits = fetch_credit_expiry(roots, store, account_id, variant).await;
+    let remaining_after = credits
+        .get("ok")
+        .and_then(|x| x.as_bool())
+        .filter(|ok| *ok)
+        .and_then(|_| credits.get("totalRemaining").and_then(|v| v.as_f64()));
+    crate::modules::ledger::record_checkin_log(
+        store,
+        account_id,
+        &email,
+        variant,
+        crate::modules::ledger::CheckinOutcome::success(total_claimed, remaining_before, remaining_after),
+    );
     json!({
         "result": "success",
         "message": format!("成功领取 {total_claimed} Credits"),
@@ -695,11 +754,19 @@ pub fn checkin_sync(
 ///
 /// `only_variant = None` 时覆盖全部档位；账号页/设置页按当前档位传入。
 /// 之前只回 `{result,count}`，前端 `res.accounts.filter` 直接崩。
+///
+/// 已有一轮签到在跑时返回 `{status:"skipped", reason:"already_running", accounts:[]}` ——
+/// 这是前端 `checkinAll` 返回值里早已声明、此前却从未被后端兑现的契约。
+/// `accounts` 保持存在（空数组）而不是省略，前端两处的 `Array.isArray` 守卫才不会误报异常。
 pub async fn checkin_all(
     roots: &PathRoots,
     store: &Path,
     only_variant: Option<QoderVariant>,
 ) -> Value {
+    // 抢不到门 = 手动或自动已有一轮在跑，直接让出，不排队。
+    let Some(_gate) = try_acquire_checkin() else {
+        return json!({ "status": "skipped", "reason": "already_running", "accounts": [] });
+    };
     let accounts = bundle::list_all(store);
     let mut out = Vec::new();
     for b in accounts {

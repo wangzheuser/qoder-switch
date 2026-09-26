@@ -1,9 +1,10 @@
 # 项目级 cargo 配置。
 #
-# 产物目录不再在这里钉死：GitHub Actions 的 runner 没有 E: 盘，钉在这里会让 CI 全挂。
-# 本机的 C: 盘装不下 release target（约 7GB），由 scripts/build.sh 显式导出
-# CARGO_TARGET_DIR=E:/qs-target 兜底；手动跑 cargo 时也请带上这个环境变量，
-# 见 scripts/build.sh 与 README 的构建节。
+# 这里不钉产物目录：GitHub Actions 的 runner 没有 E: 盘，钉在这里会让 CI 全挂。
+# 缺省就是 cargo 自己的 <仓库根>/target，与 scripts/build.sh、scripts/build.ps1、
+# scripts/clean.sh、scripts/clean.ps1 四侧推导的缺省值同一条规则（它们只在环境变量
+# 没给时才填这个值，给了就按给的走）。手动跑 cargo 不用带任何环境变量。
+# 想把产物挪出仓库（例如系统盘吃紧）就自己 export CARGO_TARGET_DIR，四个脚本都跟随它。
 
 [net]
 git-fetch-with-cli = true
