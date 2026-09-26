@@ -73,6 +73,22 @@ powershell -ExecutionPolicy Bypass -File scripts/build.ps1 release
 powershell -ExecutionPolicy Bypass -File scripts/build.ps1 all
 ```
 
+**在 cmd.exe 里**用 `scripts\build.bat`（cmd 不能直接执行 `.ps1`：`.\build.ps1` 会报
+`'.' is not recognized as an internal or external command`，裸敲 `build.ps1` 又取决于机器的
+文件关联与执行策略）：
+
+```bat
+scripts\build.bat deps        :: 在 scripts 目录里就写 build.bat
+scripts\build.bat release
+scripts\build.bat all
+```
+
+`build.bat` 只是启动器，逻辑仍在 `build.ps1` 里，参数与退出码原样透传。cmd 里要写 `build.bat`
+或 `.\build.bat` —— `./build.bat` 一样不认，正斜杠被 cmd 当成开关。
+它**必须保持纯 ASCII**：cmd 按 OEM 代码页（本机 936）读批处理，UTF-8 中文会被当 GBK 双字节
+配对并吞掉紧随的 ASCII 字节，连 `rem` 注释行都会碎成命令执行（实测报
+`'的' is not recognized`）。这与 `.ps1` 反过来必须带 UTF-8 BOM 是两回事，别照搬。
+
 两套入口是**同义不同源**的：子命令、退出码（0 成功 / 1 失败 / 2 用法错）、磁盘阈值、构建锁
 与清理落点表都对齐，但各按自己语言的习惯实现（`.ps1` 必须存成 UTF-8 带 BOM，否则 PowerShell
 5.1 解码中文常量成乱码；原生命令的退出码只能逐条查 `$LASTEXITCODE`）。共用逻辑不抄两遍：

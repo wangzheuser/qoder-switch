@@ -62,6 +62,15 @@
     于是 target 会落到调用者目录 —— 正是 `build.sh` 头部注释里点名踩过的那个坑。
     现三处统一改走 `cd` 之前算好的绝对 `$SCRIPT_DIR`（`.ps1` 侧用 `$PSScriptRoot` /
     `$PSCommandPath`，本来就没有这个问题）。
+  - **`scripts/build.bat`：cmd.exe 启动器**。此前在 cmd 里跑构建只有
+    `powershell -File scripts\build.ps1 …` 一条长命令：cmd 不认 `.\build.ps1`
+    （报 `'.' is not recognized as an internal or external command`），裸敲 `build.ps1`
+    则取决于机器的 `.ps1` 文件关联与执行策略。`build.bat` 只起一个显式 PowerShell 宿主并
+    透传参数与退出码（实测 0/1/2 三级都能原样穿回 cmd）。
+    **该文件必须纯 ASCII**：cmd 按 OEM 代码页（本机 936）读批处理，UTF-8 中文会被当 GBK
+    双字节配对并吞掉紧随的 ASCII 字节，注释行会碎成命令执行（实测报 `'的' is not recognized`）
+    —— 与 `.ps1` 反过来必须带 UTF-8 BOM 正好相反。另注意 cmd 里 `./build.bat` 也不认，
+    斜杠被当开关，得写 `build.bat` 或 `.\build.bat`。
 - **账号库自动备份（把"账号凭空消失"从不可恢复降级成可一键恢复）**：
   每次账号库变动（认领本机账号 / 导入备份 / 扫码登录落包 / 删除账号）都把**整库**
   导出一份到 `<用户文档目录>/QoderSwitch-AccountBackups/`，按文件名时间戳保留最近
