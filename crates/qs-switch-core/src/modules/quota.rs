@@ -520,7 +520,15 @@ pub async fn checkin(
     let (token, email, proxy) = match resolve_identity_full(roots, store, account_id, variant) {
         Ok(t) => t,
         Err(e) => {
-            crate::modules::ledger::record_checkin_log(store, account_id, "", variant, "error", Some(&e));
+            // email 这里拿不到（解析失败正是因为它拿不到），留空即可：
+            // record_checkin_log 会按 account_id 兜底出账号名。
+            crate::modules::ledger::record_checkin_log(
+                store,
+                account_id,
+                "",
+                variant,
+                crate::modules::ledger::CheckinOutcome::error(&e),
+            );
             return json!({ "result": "error", "error": e });
         }
     };
@@ -539,12 +547,12 @@ pub async fn checkin(
         Ok(res) if res.status().is_success() => res.json().await.unwrap_or_default(),
         Ok(res) => {
             let e = format_http_error("获取签到活动", res.status());
-            crate::modules::ledger::record_checkin_log(store, account_id, &email, variant, "error", Some(&e));
+            crate::modules::ledger::record_checkin_log(store, account_id, &email, variant, crate::modules::ledger::CheckinOutcome::error(&e));
             return json!({ "result": "error", "error": e });
         }
         Err(e) => {
             let msg = format!("网络错误: {e}");
-            crate::modules::ledger::record_checkin_log(store, account_id, &email, variant, "error", Some(&msg));
+            crate::modules::ledger::record_checkin_log(store, account_id, &email, variant, crate::modules::ledger::CheckinOutcome::error(&msg));
             return json!({ "result": "error", "error": msg });
         }
     };
@@ -583,7 +591,7 @@ pub async fn checkin(
         // 只有正面看到 CLAIMED 才报"今日已签到"。此前只判"没有可领的"就一律说已签到，
         // 把 EXPIRED/LOCKED/未知枚举也折叠成成功 —— 用户拿到绿色提示但没领到东西。
         if has_claimed {
-            crate::modules::ledger::record_checkin_log(store, account_id, &email, variant, "already", None);
+            crate::modules::ledger::record_checkin_log(store, account_id, &email, variant, crate::modules::ledger::CheckinOutcome::already());
             return json!({ "result": "already", "message": "今日已签到" });
         }
         return json!({
@@ -592,6 +600,10 @@ pub async fn checkin(
             "message": "当前没有可领取的签到奖励（活动状态未知或已结束）"
         });
     }
+
+    // 签到前的余额：读本地最近一条配额快照，零网络成本。放在领取之前 —— 领取成功后
+    // 那次配额查询会把新快照写进来，之后再读就读到"之后"了。
+    let remaining_before = crate::modules::ledger::latest_credit_remaining(store, account_id);
 
     let mut total_claimed = 0f64;
     let mut success_count = 0usize;
@@ -625,11 +637,27 @@ pub async fn checkin(
 
     if success_count == 0 {
         let e = last_err.unwrap_or_else(|| "领取失败".to_string());
-        crate::modules::ledger::record_checkin_log(store, account_id, &email, variant, "error", Some(&e));
+        crate::modules::ledger::record_checkin_log(store, account_id, &email, variant, crate::modules::ledger::CheckinOutcome::error(&e));
         return json!({ "result": "error", "error": e });
     }
 
-    crate::modules::ledger::record_checkin_log(store, account_id, &email, variant, "success", None);
+    // 领完之后复查一次余额，作为"确实到账"的正面证据 —— 这个模块反复踩过的坑是把
+    // 没证据的状态折叠成好消息（见上面 CLAIMED 那段注释），而 claim 返回 200 并不等于
+    // 分已经加到账户上。代价是每账号每天一次额外请求，只走成功分支。
+    // 顺带：这次查询会落一条 CreditSnapshot，统计页的趋势线也因此更密。
+    let credits = fetch_credit_expiry(roots, store, account_id, variant).await;
+    let remaining_after = credits
+        .get("ok")
+        .and_then(|x| x.as_bool())
+        .filter(|ok| *ok)
+        .and_then(|_| credits.get("totalRemaining").and_then(|v| v.as_f64()));
+    crate::modules::ledger::record_checkin_log(
+        store,
+        account_id,
+        &email,
+        variant,
+        crate::modules::ledger::CheckinOutcome::success(total_claimed, remaining_before, remaining_after),
+    );
     json!({
         "result": "success",
         "message": format!("成功领取 {total_claimed} Credits"),

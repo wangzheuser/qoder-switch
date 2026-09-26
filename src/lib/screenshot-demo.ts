@@ -386,7 +386,28 @@ function rateLimitHookStatus(): RateLimitHookStatus {
 }
 
 function checkinLogs(): CheckinLog[] {
-  return hydratedAccounts().flatMap((account, accountIndex) => [0, 1, 2].map((daysAgo) => ({ ts: atLocalTime(daysAgo, 8, 6 + accountIndex * 9), accountId: account.id, email: account.nickname ?? account.email ?? account.id, result: accountIndex === 1 && daysAgo === 0 ? "already" : "success" })));
+  return hydratedAccounts()
+    .flatMap((account, accountIndex) =>
+      [0, 1, 2].map((daysAgo) => {
+        const name = account.nickname ?? account.email ?? account.uid ?? account.id;
+        const already = accountIndex === 1 && daysAgo === 0;
+        const before = 420 - daysAgo * 60 - accountIndex * 20;
+        return {
+          ts: atLocalTime(daysAgo, 8, 6 + accountIndex * 9),
+          accountId: account.id,
+          // email 与 accountName 分开填：真实数据里 email 常年为空，展示名走兜底链，
+          // 演示数据全塞进 email 就把这条链路整个掩盖掉了。
+          email: account.email ?? "",
+          accountName: name,
+          result: already ? "already" : "success",
+          claimed: already ? null : 120,
+          remainingBefore: already ? null : before,
+          remainingAfter: already ? null : before + 120,
+        };
+      }),
+    )
+    // 真实后端返回"新的在前"，界面不再自己反转，所以演示数据也得按这个顺序给。
+    .sort((a, b) => b.ts - a.ts);
 }
 
 function rotateLogs(): RotateLog[] {

@@ -341,10 +341,23 @@ export interface CheckinLog {
   ts: number;
   accountId: string | null;
   email: string;
+  /**
+   * 展示名：后端按 `email → 账号包里的 email/name/uid → accountId` 兜底。
+   * 老日志没这个键，渲染时仍要自己回落一次。
+   */
+  accountName?: string;
   result: string;
   error?: string;
   /** 该行所属档位；历史日志缺省按国内版处理。 */
   variant?: WbVariant;
+  /** 本次领到的 Credits。`already`/`error` 没有这个数，不能塌成 0。 */
+  claimed?: number | null;
+  /** 签到前余额：取自该账号最近一条配额快照，可能有最多 10 分钟的滞后。 */
+  remainingBefore?: number | null;
+  /** 签到后余额：领取成功后复查一次配额得到；复查失败时为空。 */
+  remainingAfter?: number | null;
+  /** 账号包已被删除（日志仍保留）。`local-*` 现场账号不会被标。 */
+  accountGone?: boolean;
 }
 
 export interface CheckinResult {

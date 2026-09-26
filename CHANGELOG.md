@@ -100,8 +100,32 @@
   - 默认入口 `export_import::auto_backup_default` **只认真实账号库**
     （`store == switch_root()`），沙箱 store 一律返回 `None` ——
     避免跑一次测试就往用户的文档目录里写凭据副本（有测试钉死这条契约）。
+- **签到日志补上「哪个账号 / 领到多少 / 余额怎么变」**：设置页那条日志此前只有状态与时间，
+  账号列渲染的是 `email`，而国内版桌面登录态里 `user.email` 常年为空 —— 实测本机三条日志
+  `email` 全为 `""`，于是整行左边什么都没有，用户只能看到三个"签到成功"。
+  - 展示名统一走 `ledger::account_label`：`email → 账号包里的 email/name/uid → accountId`。
+    口径与账号卡（`nickname||email||uid||id`）和统计事件一致，不再三处各抄一遍。
+  - 新增 `claimed`（本次领到的 Credits）：这个数 `checkin()` 早就从 claim 响应的
+    `benefit.amount` 汇总出来并回给前端了，只差没落盘。`already`/`error` 用 `None` 而不是 0
+    —— 0 会被读成"领到了 0 分"；前端 `already` 明确写「未新增积分」而不是留白让人猜。
+  - 新增 `remainingBefore` / `remainingAfter`（签到前后余额）。before 取该账号最近一条配额
+    快照，零网络成本（代价是最多 10 分钟的快照节流滞后，字段注释里写明了）；after 在领取
+    成功后复查一次配额，**每账号每天一次额外请求，只走成功分支** —— 换来的正是"确实到账"的
+    正面证据，与 `CLAIMED` 那次修的"把没证据的状态折叠成好消息"同源。复查失败就留空，
+    不拿旧值冒充。
+  - 读取侧补 `accountGone`：账号包后来被删的日志行标「已不在库中」；`local-*` 是桌面现场
+    账号的合成 id，本来就没有包，绝不能打这个标（有测试钉住这一侧）。
+  - 列表改为最新在前，并删掉前端那次 `.reverse()`：此前它把后端已经排好序的"新的在前"
+    又倒过来，配合 `max-h-64` 的滚动容器，打开永远看到的是最旧的三条。
 
 ### 缺陷修复
+- **签到日志的 JSON 键名与前端契约不符，导致账号列没有任何回落余地**：`CheckinLogEntry`
+  没有 `rename_all`，落盘是 `account_id`，而 `src/lib/types.ts` 的 `CheckinLog` 声明的是
+  `accountId` —— 前端读回来恒为 `undefined`，所以 `email` 为空时连"退化成显示账号 id"都做不到
+  （`email` 为空是常态，见上一条）。现补 `#[serde(rename_all = "camelCase")]`，并给
+  `account_id` 加 `alias`，让已落盘的老日志不迁移也能读回（新增测试用一份手写旧格式文件
+  钉住这条兼容）。连带 `ledger.rs` 里那句 `l["accountId"] != "acct-old"` 从**恒真的空断言**
+  （键根本不存在，`Null != "acct-old"`）变成真的能钉住裁剪行为。
 - **`launcher_exe` 在 POSIX 路径下恒为 `None`**：目录前缀比较无条件 `push('\\')`，
   mac 上规范化路径永不匹配，导致自动重启被静默降级成"请手动打开"。改为按宿主分隔符。
 - **updater 清单平台键与 Tauri 不一致**：`core::update` 曾请求 `latest-macos-<arch>.json`，
